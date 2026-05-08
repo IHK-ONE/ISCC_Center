@@ -1131,6 +1131,7 @@ function renderConfigPage() {
         <h3>ISCC 请求</h3>
         <div class="field"><label>ISCC 地址</label><input id="cfgBaseUrl" value="${h(c.iscc?.base_url || '')}"></div>
         <div class="field"><label>请求超时（秒）</label><input id="cfgTimeout" type="number" min="3" max="120" value="${h(c.iscc?.timeout || 15)}"></div>
+        <div class="field"><label>操作间隔延时（秒）</label><input id="cfgDelay" type="number" min="0" max="60" step="0.1" value="${h(c.iscc?.operation_delay_seconds ?? 0)}"><p class="muted">用于批量同步、附件更新和批量提交时控制账号/题目处理间隔，最大 60 秒。</p></div>
         <div class="field"><label>提交参数方式</label><select id="cfgPayload"><option value="data" ${c.iscc?.submit_payload_mode === 'data' ? 'selected' : ''}>POST 表单</option><option value="params" ${c.iscc?.submit_payload_mode !== 'data' ? 'selected' : ''}>POST 地址参数</option></select></div>
         <label class="check"><input id="cfgVerify" type="checkbox" ${c.iscc?.verify_tls ? 'checked' : ''}> 校验 TLS 证书</label>
         <div class="field"><label>跳过下载分类（逗号分隔，可留空）</label><input id="cfgSkipCats" value="${h((c.iscc?.skip_file_categories || []).join(','))}" placeholder="WEB,PWN"></div>
@@ -1537,6 +1538,7 @@ function configBodyFromDom() {
     iscc: {
       base_url: document.getElementById('cfgBaseUrl').value.trim(),
       timeout: Number(document.getElementById('cfgTimeout').value || 15),
+      operation_delay_seconds: Number(document.getElementById('cfgDelay').value || 0),
       verify_tls: document.getElementById('cfgVerify').checked,
       submit_payload_mode: document.getElementById('cfgPayload').value,
       skip_file_categories: document.getElementById('cfgSkipCats').value.split(',').map(x => x.trim().toUpperCase()).filter(Boolean),

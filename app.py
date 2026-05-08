@@ -34,6 +34,8 @@ FILES_FILE = DATA_DIR / "files.json"
 FLAGS_FILE = DATA_DIR / "flags.json"
 ISCC_BASE_URL = "https://iscc.isclab.org.cn"
 ISCC_RETRY_ATTEMPTS = 3
+OPERATION_DELAY_DEFAULT_SECONDS = 0
+OPERATION_DELAY_MAX_SECONDS = 60
 
 
 class ISCCError(Exception):
@@ -73,6 +75,7 @@ def default_config():
             "base_url": ISCC_BASE_URL,
             "verify_tls": False,
             "timeout": 15,
+            "operation_delay_seconds": OPERATION_DELAY_DEFAULT_SECONDS,
             "skip_file_categories": [],
             "submit_payload_mode": "data",
             "proxy": {
@@ -106,7 +109,17 @@ def normalize_config(cfg):
     proxy.setdefault("enabled", False)
     if proxy.get("mode") not in {"round_robin", "random"}:
         proxy["mode"] = "round_robin"
-    cfg["iscc"].pop("submit_delay_seconds", None)
+    legacy_delay = cfg["iscc"].pop("submit_delay_seconds", None)
+    if "operation_delay_seconds" not in cfg["iscc"] and legacy_delay not in (None, ""):
+        cfg["iscc"]["operation_delay_seconds"] = legacy_delay
+    try:
+        cfg["iscc"]["operation_delay_seconds"] = parse_delay_seconds(
+            cfg["iscc"].get("operation_delay_seconds"),
+            default=OPERATION_DELAY_DEFAULT_SECONDS,
+            max_seconds=OPERATION_DELAY_MAX_SECONDS,
+        )
+    except ISCCError:
+        cfg["iscc"]["operation_delay_seconds"] = float(OPERATION_DELAY_DEFAULT_SECONDS)
     cfg["iscc"].pop("submit_proxy_failover", None)
     proxy["list"] = parse_proxy_list(proxy.get("list", []))
     cfg.pop("safety", None)
@@ -571,10 +584,19 @@ def parse_delay_seconds(value, default=0, max_seconds=60):
     try:
         delay = float(value)
     except (TypeError, ValueError) as exc:
-        raise ISCCError("更新延时必须是数字") from exc
+        raise ISCCError("延时时长必须是数字") from exc
     if delay < 0:
-        raise ISCCError("更新延时不能为负数")
+        raise ISCCError("延时时长不能为负数")
     return min(delay, float(max_seconds))
+
+
+def configured_operation_delay(cfg):
+    return float(cfg.get("iscc", {}).get("operation_delay_seconds") or OPERATION_DELAY_DEFAULT_SECONDS)
+
+
+def sleep_between_progress_items(progress_id, delay_seconds, index, total):
+    if index < total and delay_seconds > 0:
+        sleep_with_progress_control(progress_id, delay_seconds)
 
 
 def sanitize_name(value, fallback="item"):
@@ -1584,7 +1606,7 @@ def ensure_challenge_detail_before_submit(client, chal_id, account_id=None, forc
     return detail
 
 
-def previsit_cached_challenge_details(client, account_id=None, challenge_ids=None, progress_id=None, username=None):
+def previsit_cached_challenge_details(client, account_id=None, challenge_ids=None, progress_id=None, username=None, delay_seconds=0):
     items = load_challenges().get("items", {})
     ids = [str(item) for item in (challenge_ids or items.keys()) if str(item).strip()]
     for index, chal_id in enumerate(ids, start=1):
@@ -1601,6 +1623,7 @@ def previsit_cached_challenge_details(client, account_id=None, challenge_ids=Non
             mark_challenge_detail_visited(account_id, client, chal_id)
         except ISCCError as exc:
             log_event("warn", "challenge_detail_previsit_failed", account_id=account_id, username=username or client.username, chal_id=chal_id, proxy=client.proxy_label, error=str(exc))
+        sleep_between_progress_items(progress_id, delay_seconds, index, len(ids))
 
 
 def flag_record_key(chal_id, flag_hash, attachment_md5=""):
@@ -2023,6 +2046,15 @@ def api_config_patch():
             cfg["iscc"]["timeout"] = max(3, min(120, int(iscc.get("timeout") or 15)))
         except (TypeError, ValueError):
             return api_error("请求超时必须是数字")
+    if "operation_delay_seconds" in iscc:
+        try:
+            cfg["iscc"]["operation_delay_seconds"] = parse_delay_seconds(
+                iscc.get("operation_delay_seconds"),
+                default=OPERATION_DELAY_DEFAULT_SECONDS,
+                max_seconds=OPERATION_DELAY_MAX_SECONDS,
+            )
+        except ISCCError as exc:
+            return api_error(str(exc))
     if "verify_tls" in iscc:
         cfg["iscc"]["verify_tls"] = bool(iscc.get("verify_tls"))
     if "skip_file_categories" in iscc and isinstance(iscc.get("skip_file_categories"), list):
@@ -2040,15 +2072,19 @@ def api_config_patch():
         cfg["iscc"]["proxy"]["mode"] = mode
 
     cfg = save_config(cfg)
-    ACCOUNT_PROXY_BINDINGS.clear()
     old_iscc = old_cfg.get("iscc", {})
     new_iscc = cfg.get("iscc", {})
     cache_breaking_changed = any(old_iscc.get(key) != new_iscc.get(key) for key in ("base_url", "submit_payload_mode"))
-    if cache_breaking_changed:
-        clear_client_cache()
-    else:
-        with CLIENT_CACHE_LOCK:
-            sync_cached_clients_after_config_saved(cfg)
+    client_config_changed = cache_breaking_changed or any(
+        old_iscc.get(key) != new_iscc.get(key)
+        for key in ("verify_tls", "timeout", "proxy")
+    )
+    if client_config_changed:
+        if cache_breaking_changed:
+            clear_client_cache()
+        else:
+            with CLIENT_CACHE_LOCK:
+                sync_cached_clients_after_config_saved(cfg)
     return api_ok(safe_config(cfg))
 
 
@@ -2112,6 +2148,7 @@ def api_sync_challenges():
     if not account_id:
         return api_error("请选择用于同步题目的账号")
     cfg = load_config()
+    delay_seconds = configured_operation_delay(cfg)
     accounts_data, accounts = get_accounts_by_ids([account_id], enabled_only=False)
     if not accounts:
         return api_error("账号不存在或不可用，请重新选择")
@@ -2154,6 +2191,7 @@ def api_sync_challenges():
                 items[str(chal_id)] = partial
                 errors.append({"chal_id": chal_id, "error": str(exc)})
                 save_challenges({"updated_at": utc_now(), "items": items})
+            sleep_between_progress_items(progress_id, delay_seconds, index, total)
         items = {chal_id: item for chal_id, item in items.items() if chal_id in seen_ids or chal_id not in challenges_data.get("items", {})}
         save_challenges({"updated_at": utc_now(), "items": items})
         save_accounts(accounts_data)
@@ -2174,6 +2212,7 @@ def api_sync_solves():
     if not account_ids:
         return api_error("请选择需要同步题解的账号")
     cfg = load_config()
+    delay_seconds = configured_operation_delay(cfg)
     accounts_data, accounts = get_accounts_by_ids(account_ids, enabled_only=False)
     if not accounts:
         return api_error("账号不存在或不可用，请重新选择")
@@ -2202,6 +2241,7 @@ def api_sync_solves():
             save_accounts(accounts_data)
             results.append({"account_id": account["id"], "account_username": account.get("username"), "ok": False, "error": str(exc), "count": 0})
             add_progress_event(progress_id, account.get("username"), False, f"同步题解失败：{exc}")
+        sleep_between_progress_items(progress_id, delay_seconds, index, total)
     solves_data["updated_at"] = utc_now()
     save_solves(solves_data)
     save_accounts(accounts_data)
@@ -2218,6 +2258,7 @@ def sync_run_operation(progress_id, body):
     chal_ids = body.get("chal_ids") if isinstance(body.get("chal_ids"), list) and body.get("chal_ids") else None
     requested_ids = {str(item) for item in chal_ids if str(item).strip()} if chal_ids else None
     cfg = load_config()
+    delay_seconds = configured_operation_delay(cfg)
     accounts_data, accounts = get_accounts_by_ids(account_ids, enabled_only=False)
     if not accounts:
         raise ISCCError("账号不存在或不可用，请重新选择")
@@ -2264,6 +2305,7 @@ def sync_run_operation(progress_id, body):
                 partial.setdefault("files", [])
                 items[str(chal_id)] = partial
                 errors.append({"chal_id": chal_id, "error": str(exc)})
+            sleep_between_progress_items(progress_id, delay_seconds, detail_index, len(listed))
         if requested_ids is None:
             items = {chal_id: item for chal_id, item in items.items() if chal_id in seen_ids}
         save_challenges({"updated_at": utc_now(), "items": items})
@@ -2287,7 +2329,7 @@ def sync_run_operation(progress_id, body):
         try:
             client = get_ready_client(account, accounts_data, cfg)
             if synced_challenge_ids:
-                previsit_cached_challenge_details(client, account_id=account["id"], challenge_ids=synced_challenge_ids, progress_id=progress_id, username=account.get("username"))
+                previsit_cached_challenge_details(client, account_id=account["id"], challenge_ids=synced_challenge_ids, progress_id=progress_id, username=account.get("username"), delay_seconds=delay_seconds)
             solves = client.list_solves()
             set_account_solves(solves_data, account, solves)
             results.append({"account_id": account["id"], "account_username": account.get("username"), "ok": True, "count": len(solves)})
@@ -2295,6 +2337,7 @@ def sync_run_operation(progress_id, body):
         except ISCCError as exc:
             results.append({"account_id": account["id"], "account_username": account.get("username"), "ok": False, "error": str(exc), "count": 0})
             add_progress_event(progress_id, account.get("username"), False, f"题解同步失败：{exc}")
+        sleep_between_progress_items(progress_id, delay_seconds, index, total)
     solves_data["updated_at"] = utc_now()
     save_solves(solves_data)
     save_accounts(accounts_data)
@@ -2566,6 +2609,7 @@ def api_submit():
 
 def submit_batch_operation(progress_id, body):
     cfg = load_config()
+    delay_seconds = configured_operation_delay(cfg)
     submissions = body.get("submissions") if isinstance(body.get("submissions"), list) else []
     if not submissions and body.get("chal_id") and body.get("flag"):
         submissions = [{"chal_id": body.get("chal_id"), "flag": body.get("flag")}]
@@ -2629,7 +2673,7 @@ def submit_batch_operation(progress_id, body):
         try:
             client = get_ready_client(account, accounts_data, cfg)
             any_success = False
-            for item in pending_items:
+            for item_index, item in enumerate(pending_items, start=1):
                 check_progress_control(progress_id)
                 if consume_progress_skip(progress_id):
                     add_progress_event(progress_id, account.get("username"), True, f"已跳过提交题目：{item['chal_id']}", chal_id=item["chal_id"])
@@ -2667,6 +2711,7 @@ def submit_batch_operation(progress_id, body):
                             "error": str(exc),
                         }
                     )
+                sleep_between_progress_items(progress_id, delay_seconds, item_index, len(pending_items))
             add_progress_event(progress_id, account.get("username"), account_ok, "提交成功" if account_ok else (account_errors[0] if account_errors else "提交失败"))
             if any_success:
                 try:
@@ -2694,6 +2739,7 @@ def submit_batch_operation(progress_id, body):
                         "error": str(exc),
                     }
                 )
+        sleep_between_progress_items(progress_id, delay_seconds, index, total)
     save_accounts(accounts_data)
     update_progress(progress_id, total, total, message="批量提交完成", done=True, ok=True)
     return {"results": results}
@@ -2714,6 +2760,7 @@ def api_submit_batch():
 
 def files_update_operation(progress_id, body):
     cfg = load_config()
+    delay_seconds = configured_operation_delay(cfg)
     account_ids = body.get("account_ids") if isinstance(body.get("account_ids"), list) and body.get("account_ids") else None
     if not account_ids:
         raise ISCCError("请选择需要更新附件的账号")
@@ -2842,6 +2889,7 @@ def files_update_operation(progress_id, body):
                 }
             )
             save_accounts(accounts_data)
+        sleep_between_progress_items(progress_id, delay_seconds, index, total)
     files_data["updated_at"] = utc_now()
     save_files(files_data)
     if solves_changed:
