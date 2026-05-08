@@ -1,3 +1,5 @@
+const DEFAULT_PROXY_MAX_LATENCY = 1500;
+
 const state = {
   status: null,
   tab: 'dashboard',
@@ -17,9 +19,9 @@ const state = {
   batchAccountSelectionDirty: false,
   proxyTestResults: [],
   proxyTesting: false,
-  proxyMaxLatency: 1500,
+  proxyMaxLatency: DEFAULT_PROXY_MAX_LATENCY,
   configDraft: null,
-  submit: { singleChal: '', singleAccount: '', batchChal: '', singleFlag: '', batchFlag: '', batchMd5: '' },
+  submit: { batchChal: '', batchFlag: '', batchMd5: '' },
   modalChallenge: null,
   operationPanel: null,
   expandedUserLists: {},
@@ -705,24 +707,6 @@ function challengeFlags(chalId) {
   });
 }
 
-function attachmentMd5For(accountId, chalId) {
-  const file = state.files.find(f => f.account_id === accountId && String(f.challenge_id) === String(chalId) && f.md5);
-  return file?.md5 || '';
-}
-
-function submitAccountOptions(chalId, selectedAccountId='') {
-  const blocked = submittedAccountIds(chalId);
-  const available = state.accounts.filter(a => !blocked.has(a.id));
-  const selected = available.some(a => a.id === selectedAccountId) ? selectedAccountId : '';
-  if (selectedAccountId && !selected) state.submit.singleAccount = '';
-  const options = state.accounts.map(a => {
-    const disabled = blocked.has(a.id);
-    const suffix = disabled ? '（已解/已提交）' : '';
-    return `<option value="${h(a.id)}" ${selected === a.id ? 'selected' : ''} ${disabled ? 'disabled' : ''}>${h(a.username)}${suffix}</option>`;
-  }).join('');
-  return `<option value="" ${selected ? '' : 'selected'} disabled>请选择账号</option>${options}`;
-}
-
 function pruneBatchSelection() {
   const existing = new Set(state.accounts.map(account => account.id));
   state.batchAccountIds = state.batchAccountIds.filter(id => existing.has(id));
@@ -746,12 +730,10 @@ function batchAccountChecks(chalId) {
 function updateSubmitState(kind, value) {
   captureSubmitInputs();
   state.submit[kind] = value;
-  if (kind === 'singleChal') state.submit.singleAccount = '';
   renderMainOrApp();
 }
 
 function captureSubmitInputs() {
-  state.submit.singleFlag = document.getElementById('singleFlag')?.value || state.submit.singleFlag || '';
   state.submit.batchFlag = document.getElementById('batchFlag')?.value || state.submit.batchFlag || '';
   state.submit.batchMd5 = document.getElementById('batchMd5')?.value || state.submit.batchMd5 || '';
 }
@@ -1062,14 +1044,14 @@ function matchBatchAccountsByMd5(showToast=true) {
   if (!md5) {
     state.batchAccountSelectionDirty = true;
     state.batchAccountIds = [];
-    batchAccountInputs().forEach(item => item.checked = false);
+    setChecked('.batchAccount', false);
     return;
   }
   const matches = state.files.filter(f => String(f.md5 || '').trim().toLowerCase() === md5 && f.account_id);
   if (!matches.length) {
     state.batchAccountSelectionDirty = true;
     state.batchAccountIds = [];
-    batchAccountInputs().forEach(item => item.checked = false);
+    setChecked('.batchAccount', false);
     if (showToast) toast('没有匹配到该 MD5 的附件用户', 'warn');
     return;
   }
@@ -1118,7 +1100,7 @@ function proxyDelayClass(ms, ok, status) {
   if (status === 'pending' || status === 'testing') return 'pending';
   if (!ok) return 'bad';
   if (ms <= 600) return 'good';
-  if (ms <= 1500) return 'warn';
+  if (ms <= (state.proxyMaxLatency || DEFAULT_PROXY_MAX_LATENCY)) return 'warn';
   return 'bad';
 }
 
@@ -1157,7 +1139,7 @@ function renderConfigPage() {
         <h3>代理</h3>
         <label class="check"><input id="cfgProxyEnabled" type="checkbox" ${c.iscc?.proxy?.enabled ? 'checked' : ''}> 启用代理</label>
         <div class="field"><label>代理列表（空格或换行分隔）</label><textarea id="cfgProxyList" placeholder="http://127.0.0.1:8000&#10;http://127.0.0.1:7890&#10;http://127.0.0.1:9000">${h((c.iscc?.proxy?.list || []).join('\n'))}</textarea></div>
-        <div class="grid cols-2"><div class="field"><label>选择方式</label><select id="cfgProxyMode"><option value="round_robin" ${c.iscc?.proxy?.mode !== 'random' ? 'selected' : ''}>按账号固定绑定</option><option value="random" ${c.iscc?.proxy?.mode === 'random' ? 'selected' : ''}>每次请求随机代理</option></select></div><div class="field"><label>最大允许延迟（ms）</label><input id="cfgProxyMaxLatency" type="number" min="1" step="100" value="${h(state.proxyMaxLatency || 1500)}" placeholder="超过也删除"></div></div>
+        <div class="grid cols-2"><div class="field"><label>选择方式</label><select id="cfgProxyMode"><option value="round_robin" ${c.iscc?.proxy?.mode !== 'random' ? 'selected' : ''}>按账号固定绑定</option><option value="random" ${c.iscc?.proxy?.mode === 'random' ? 'selected' : ''}>每次请求随机代理</option></select></div><div class="field"><label>最大允许延迟（ms）</label><input id="cfgProxyMaxLatency" type="number" min="1" step="100" value="${h(state.proxyMaxLatency || DEFAULT_PROXY_MAX_LATENCY)}" placeholder="超过也删除"></div></div>
         <p class="muted">固定绑定会在每次保存配置后按账号顺序重新分配；随机代理会在每一次 ISCC 请求发出前从代理池随机选择一个代理。</p>
         <div class="toolbar"><button class="ghost" onclick="testProxyUi()" ${state.proxyTesting ? 'disabled' : ''}>${state.proxyTesting ? '正在测试代理' : '一键测试代理'}</button></div>
         <div id="proxy-test-results">${proxyTestTable()}</div>
@@ -1258,11 +1240,11 @@ function closeOperationPanel() {
 }
 
 function setOperationAccounts(checked) {
-  document.querySelectorAll('.opAccount').forEach(input => { input.checked = checked; });
+  setChecked('.opAccount', checked);
 }
 
 function setOperationChallenges(checked) {
-  document.querySelectorAll('.opChallenge').forEach(input => { input.checked = checked; });
+  setChecked('.opChallenge', checked);
 }
 
 async function runOperationPanel() {
@@ -1376,7 +1358,6 @@ async function deleteAccount(id) {
     await api(`/api/accounts/${id}`, { method: 'DELETE' });
     state.loginAccountIds = state.loginAccountIds.filter(accountId => accountId !== id);
     state.batchAccountIds = state.batchAccountIds.filter(accountId => accountId !== id);
-    if (state.submit.singleAccount === id) state.submit.singleAccount = '';
     toast('账号已删除，本地题解/附件记录已同步清理，Flag 记录已保留', 'success');
     await refreshKinds(['accounts', 'challenges', 'files', 'flags', 'logs'], true);
   } catch (err) { toast(err.message); }
@@ -1578,7 +1559,7 @@ async function testProxyUi() {
   if (state.proxyTesting) return;
   const body = configBodyFromDom();
   const proxies = proxyListFromDom();
-  const maxLatency = Math.max(1, Number(document.getElementById('cfgProxyMaxLatency')?.value || state.proxyMaxLatency || 1500));
+  const maxLatency = Math.max(1, Number(document.getElementById('cfgProxyMaxLatency')?.value || state.proxyMaxLatency || DEFAULT_PROXY_MAX_LATENCY));
   state.proxyMaxLatency = maxLatency;
   if (!proxies.length) {
     state.proxyTestResults = [];

@@ -108,10 +108,7 @@ def normalize_config(cfg):
         proxy["mode"] = "round_robin"
     cfg["iscc"].pop("submit_delay_seconds", None)
     cfg["iscc"].pop("submit_proxy_failover", None)
-    if isinstance(proxy.get("list"), str):
-        proxy["list"] = [line.strip() for line in proxy["list"].splitlines() if line.strip()]
-    elif not isinstance(proxy.get("list"), list):
-        proxy["list"] = []
+    proxy["list"] = parse_proxy_list(proxy.get("list", []))
     cfg.pop("safety", None)
     return cfg
 
@@ -2088,7 +2085,7 @@ def api_config_proxy_test():
                 headers={"User-Agent": "Mozilla/5.0 (compatible; ISCC-Flask-Manager/1.0)"},
                 timeout=timeout,
                 verify=verify_tls,
-                proxies={"http": proxy_url, "https": proxy_url},
+                proxies=proxy_dict(proxy_url),
             )
             row["latency_ms"] = int((time.monotonic() - started) * 1000)
             row["status_code"] = response.status_code
