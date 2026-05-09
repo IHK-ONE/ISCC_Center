@@ -38,6 +38,8 @@ OPERATION_DELAY_DEFAULT_SECONDS = 0
 OPERATION_DELAY_MAX_SECONDS = 60
 CHALLENGE_SOURCE_DEFAULT = "challenge"
 CHALLENGE_SOURCE_ARENA = "arena"
+CHALLENGE_SOURCE_MEASURE = "measure"
+CHALLENGE_SOURCES = (CHALLENGE_SOURCE_DEFAULT, CHALLENGE_SOURCE_ARENA, CHALLENGE_SOURCE_MEASURE)
 CHALLENGE_SOURCE_PATHS = {
     CHALLENGE_SOURCE_DEFAULT: {
         "list": "/chals",
@@ -52,6 +54,13 @@ CHALLENGE_SOURCE_PATHS = {
         "submit": "/are/{id}",
         "solves": "/arenasolves",
         "referer": "/arenas",
+    },
+    CHALLENGE_SOURCE_MEASURE: {
+        "list": "/measures",
+        "detail": "/measure/{id}",
+        "submit": "/measure/submit",
+        "solves": "/solves_measure",
+        "referer": "/measure",
     },
 }
 
@@ -633,6 +642,8 @@ def normalize_challenge_source(value):
     value = str(value or CHALLENGE_SOURCE_DEFAULT).strip().lower()
     if value in {"arena", "arenas", "擂台"}:
         return CHALLENGE_SOURCE_ARENA
+    if value in {"measure", "measures", "实战"}:
+        return CHALLENGE_SOURCE_MEASURE
     return CHALLENGE_SOURCE_DEFAULT
 
 
@@ -640,11 +651,39 @@ def challenge_endpoint(source, key):
     return CHALLENGE_SOURCE_PATHS[normalize_challenge_source(source)][key]
 
 
+def split_challenge_ref(value, fallback_source=CHALLENGE_SOURCE_DEFAULT):
+    raw = str(value or "").strip()
+    if ":" in raw:
+        prefix, remote_id = raw.split(":", 1)
+        source = normalize_challenge_source(prefix)
+        if source != CHALLENGE_SOURCE_DEFAULT or prefix.strip().lower() in {"challenge", "challenges"}:
+            return source, remote_id
+    return normalize_challenge_source(fallback_source), raw
+
+
+def challenge_cache_key(source, chal_id):
+    source, remote_id = split_challenge_ref(chal_id, fallback_source=source)
+    return str(remote_id) if source == CHALLENGE_SOURCE_DEFAULT else f"{source}:{remote_id}"
+
+
+def challenge_remote_id(challenge_or_id, fallback_source=CHALLENGE_SOURCE_DEFAULT):
+    if isinstance(challenge_or_id, dict):
+        return challenge_or_id.get("remote_id") or split_challenge_ref(challenge_or_id.get("id"), challenge_source(challenge_or_id))[1]
+    return split_challenge_ref(challenge_or_id, fallback_source)[1]
+
+
 def challenge_source(challenge):
-    return normalize_challenge_source((challenge or {}).get("source"))
+    if isinstance(challenge, dict):
+        source, _ = split_challenge_ref(challenge.get("id"), challenge.get("source") or CHALLENGE_SOURCE_DEFAULT)
+        return normalize_challenge_source(challenge.get("source") or source)
+    source, _ = split_challenge_ref(challenge)
+    return source
 
 
 def cached_challenge_source(chal_id, fallback=None):
+    source, _ = split_challenge_ref(chal_id, fallback_source=(fallback or {}).get("source") or CHALLENGE_SOURCE_DEFAULT)
+    if source != CHALLENGE_SOURCE_DEFAULT:
+        return source
     if fallback and fallback.get("source"):
         return challenge_source(fallback)
     challenge = load_challenges().get("items", {}).get(str(chal_id), {})
@@ -1075,9 +1114,8 @@ class ISCCClient:
                 self.reset_login_state(clear_session=True)
                 raise ISCCError("登录失败：ISCC 仍返回登录页，请检查账号密码或比赛登录状态", auth_error=True)
             self.nonce = self.get_nonce()
-            challenges = self.list_challenges_once()
-            arenas = self.list_challenges_once(CHALLENGE_SOURCE_ARENA)
-            if not isinstance(challenges, list) or not isinstance(arenas, list):
+            lists = [self.list_challenges_once(source) for source in CHALLENGE_SOURCES]
+            if not all(isinstance(items, list) for items in lists):
                 self.logged_in = False
                 raise ISCCError("登录校验失败：无法读取题目列表")
             self.logged_in = True
@@ -1129,11 +1167,14 @@ class ISCCClient:
             "Referer": self.url(challenge_endpoint(source, "referer")),
             "X-Requested-With": "XMLHttpRequest",
         }
-        submit_path = challenge_endpoint(source, "submit").format(id=chal_id)
+        remote_id = challenge_remote_id(chal_id, source)
+        submit_path = challenge_endpoint(source, "submit").format(id=remote_id)
         for payload_mode in payload_modes():
             if not self.nonce:
                 self.nonce = self.get_nonce(source)
             payload = {"key": flag, "nonce": self.nonce}
+            if source == CHALLENGE_SOURCE_MEASURE:
+                payload["id"] = remote_id
             try:
                 response = self.request("POST", submit_path, headers=headers, **{payload_mode: payload})
                 raw = response.text.strip()
@@ -1143,6 +1184,22 @@ class ISCCClient:
                 raise
             if raw == "1":
                 return {"ok": True, "raw": raw, "message": "提交成功", "payload_mode": payload_mode}
+            if raw.startswith("{"):
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    data = None
+                if isinstance(data, dict):
+                    status = str(data.get("status") or "").strip().lower()
+                    message = str(data.get("message") or data.get("msg") or raw[:80])
+                    ok = bool(data.get("ok")) or status in {"success", "ok"} or str(data.get("code")) == "1"
+                    return {
+                        "ok": ok,
+                        "raw": raw[:200],
+                        "message": "提交成功" if ok and not message else message,
+                        "payload_mode": payload_mode,
+                        "no_retry": not ok,
+                    }
             if raw == "0":
                 return {
                     "ok": False,
@@ -1235,13 +1292,14 @@ class ISCCClient:
 
     def list_all_challenges(self):
         items = []
-        for source in (CHALLENGE_SOURCE_DEFAULT, CHALLENGE_SOURCE_ARENA):
+        for source in CHALLENGE_SOURCES:
             items.extend(self.list_challenges(source))
         return items
 
     def get_challenge_detail_once(self, chal_id, source=CHALLENGE_SOURCE_DEFAULT):
         source = normalize_challenge_source(source)
-        detail_path = challenge_endpoint(source, "detail").format(id=chal_id)
+        remote_id = challenge_remote_id(chal_id, source)
+        detail_path = challenge_endpoint(source, "detail").format(id=remote_id)
         response = self.request("GET", detail_path, headers={"Accept": "application/json,*/*"})
         data = self.parse_json(response, "题目详情")
         if not isinstance(data, dict):
@@ -1273,7 +1331,7 @@ class ISCCClient:
 
     def list_all_solves(self):
         items = []
-        for source in (CHALLENGE_SOURCE_DEFAULT, CHALLENGE_SOURCE_ARENA):
+        for source in CHALLENGE_SOURCES:
             items.extend(self.list_solves(source))
         return items
 
@@ -1288,7 +1346,8 @@ class ISCCClient:
             if not files:
                 return []
 
-            chal_id = str(challenge_info.get("id"))
+            source = challenge_source(challenge_info)
+            chal_id = challenge_cache_key(source, challenge_info.get("id"))
             chal_name = challenge_info.get("name") or f"challenge-{chal_id}"
             results = []
 
@@ -1311,10 +1370,10 @@ class ISCCClient:
                             "file_id": file_id,
                             "account_id": account_id,
                             "account_username": self.username,
-                            "challenge_id": int(challenge_info.get("id")),
+                            "challenge_id": chal_id,
                             "challenge_name": chal_name,
                             "category": challenge_info.get("category"),
-                            "source": challenge_source(challenge_info),
+                            "source": source,
                             "source_url": source_url,
                             "original_name": original_name,
                             "stored_name": stored_name,
@@ -1357,10 +1416,10 @@ class ISCCClient:
                             "file_id": file_id,
                             "account_id": account_id,
                             "account_username": self.username,
-                            "challenge_id": int(challenge_info.get("id")),
+                            "challenge_id": chal_id,
                             "challenge_name": chal_name,
                             "category": challenge_info.get("category"),
-                            "source": challenge_source(challenge_info),
+                            "source": source,
                             "source_url": source_url,
                             "original_name": original_name,
                             "stored_name": stored_name,
@@ -1484,7 +1543,8 @@ def challenge_solve_map(solves_data):
         for solve in entry.get("solves", []) or []:
             chal_id = str(solve.get("chalid"))
             if chal_id and chal_id != "None":
-                solved_by_chal.setdefault(chal_id, set()).add(account_id)
+                key = challenge_cache_key(solve.get("source") or CHALLENGE_SOURCE_DEFAULT, chal_id)
+                solved_by_chal.setdefault(key, set()).add(account_id)
     return solved_by_chal
 
 
@@ -1504,7 +1564,7 @@ def flatten_files(files_data, account_id=None, chal_id=None):
                 row = dict(item)
                 row.setdefault("account_id", aid)
                 row.setdefault("account_username", account_names.get(aid, item.get("account_username", aid)))
-                row.setdefault("challenge_id", int(cid) if str(cid).isdigit() else cid)
+                row.setdefault("challenge_id", cid)
                 row.setdefault("challenge_name", challenge_display_name(chal) or item.get("challenge_name") or cid)
                 row.setdefault("category", chal.get("category") or item.get("category"))
                 row.setdefault("source", chal.get("source") or item.get("source") or CHALLENGE_SOURCE_DEFAULT)
@@ -1620,18 +1680,22 @@ def challenge_cache_has(chal_id):
 def save_challenge_detail(chal_id, detail, fallback=None):
     challenges_data = load_challenges()
     items = dict(challenges_data.get("items", {}))
-    previous = items.get(str(chal_id), {})
+    source = normalize_challenge_source((detail or {}).get("source") or (fallback or {}).get("source") or cached_challenge_source(chal_id, fallback=fallback))
+    remote_id = challenge_remote_id((detail or {}).get("id") or chal_id, source)
+    cache_key = challenge_cache_key(source, remote_id)
+    previous = items.get(cache_key, {})
     custom_name = previous.get("custom_name")
     merged = dict(fallback or previous)
     merged.update(detail or {})
-    merged["id"] = int(chal_id) if str(chal_id).isdigit() else chal_id
-    merged["source"] = normalize_challenge_source(merged.get("source") or previous.get("source"))
+    merged["id"] = cache_key
+    merged["remote_id"] = int(remote_id) if str(remote_id).isdigit() else remote_id
+    merged["source"] = source
     if custom_name:
         merged["custom_name"] = custom_name
         merged["name"] = custom_name
-    merged.setdefault("name", f"#{chal_id}")
+    merged.setdefault("name", f"#{cache_key}")
     merged.setdefault("files", [])
-    items[str(chal_id)] = merged
+    items[cache_key] = merged
     save_challenges({"updated_at": utc_now(), "items": items})
     return merged
 
@@ -1712,18 +1776,21 @@ def flag_record_key(chal_id, flag_hash, attachment_md5=""):
     attachment_md5 = str(attachment_md5 or "").strip().lower()
     if attachment_md5:
         return f"flag-md5:{flag_hash}:{attachment_md5}"
-    return f"flag-chal:{flag_hash}:{int(chal_id)}"
+    return f"flag-chal:{flag_hash}:{chal_id}"
 
 
 def submit_flag_for_account(account, client, chal_id, flag, flags_data, md5="", source="submit"):
     challenge_track = cached_challenge_source(chal_id)
-    ensure_challenge_detail_before_submit(client, int(chal_id), account_id=account.get("id"), source=challenge_track)
-    submit_result = client.submit_flag(int(chal_id), flag, source=challenge_track)
+    cache_key = challenge_cache_key(challenge_track, chal_id)
+    remote_id = challenge_remote_id(chal_id, challenge_track)
+    ensure_challenge_detail_before_submit(client, cache_key, account_id=account.get("id"), source=challenge_track)
+    submit_result = client.submit_flag(remote_id, flag, source=challenge_track)
     row = {
         "account_id": account.get("id"),
         "account_username": account.get("username"),
         "proxy": client.proxy_label,
-        "chal_id": int(chal_id),
+        "chal_id": cache_key,
+        "remote_chal_id": int(remote_id) if str(remote_id).isdigit() else remote_id,
         "source": challenge_track,
     }
     row.update(submit_result)
@@ -1734,7 +1801,7 @@ def submit_flag_for_account(account, client, chal_id, flag, flags_data, md5="", 
         account_id=account.get("id"),
         username=account.get("username"),
         proxy=client.proxy_label,
-        chal_id=int(chal_id),
+        chal_id=cache_key,
         ok=row["ok"],
         message=row.get("message"),
         raw=row.get("raw"),
@@ -1744,7 +1811,7 @@ def submit_flag_for_account(account, client, chal_id, flag, flags_data, md5="", 
         attachment_md5=md5,
     )
     if row["ok"]:
-        record_successful_flag(flags_data, account, int(chal_id), flag, md5=md5, source=challenge_track, message=row.get("message"))
+        record_successful_flag(flags_data, account, cache_key, flag, md5=md5, source=challenge_track, message=row.get("message"))
         save_flags(flags_data)
     return row
 
@@ -1753,7 +1820,8 @@ def record_successful_flag(flags_data, account, chal_id, flag, md5=None, source=
     flag = str(flag or "").strip()
     if not flag:
         return None
-    chal_id = int(chal_id)
+    source = normalize_challenge_source(source)
+    chal_id = challenge_cache_key(source, chal_id)
     now = utc_now()
     account_id = account.get("id")
     flag_hash = flag_md5(flag)
@@ -1797,6 +1865,7 @@ def record_successful_flag(flags_data, account, chal_id, flag, md5=None, source=
 
 
 def submitted_account_ids_for_challenge(chal_id, solves_data=None, flags_data=None):
+    chal_id = challenge_cache_key(cached_challenge_source(chal_id), chal_id)
     solved = set(challenge_solve_map(solves_data or load_solves()).get(str(chal_id), set()))
     for item in (flags_data or load_flags()).get("items", []) or []:
         if str(item.get("chal_id")) != str(chal_id):
@@ -2252,7 +2321,7 @@ def api_sync_challenges():
         listed = client.list_all_challenges()
         requested_ids = body.get("chal_ids") if isinstance(body.get("chal_ids"), list) and body.get("chal_ids") else None
         requested_ids = {str(item) for item in requested_ids if str(item).strip()} if requested_ids else None
-        listed = [chal for chal in listed if not requested_ids or str(chal.get("id")) in requested_ids]
+        listed = [chal for chal in listed if not requested_ids or challenge_cache_key(challenge_source(chal), chal.get("id")) in requested_ids]
         total = max(len(listed), 1)
         update_progress(progress_id, 0, total, account.get("username"), f"正在同步题目详情：0/{total}")
         challenges_data = load_challenges()
@@ -2265,26 +2334,30 @@ def api_sync_challenges():
             chal_id = chal.get("id")
             if chal_id is None:
                 continue
-            seen_ids.add(str(chal_id))
             source = challenge_source(chal)
+            cache_key = challenge_cache_key(source, chal_id)
+            seen_ids.add(cache_key)
             try:
                 detail = client.get_challenge_detail(chal_id, source=source)
-                mark_challenge_detail_visited(account.get("id"), client, chal_id)
+                mark_challenge_detail_visited(account.get("id"), client, cache_key)
                 merged = dict(chal)
                 merged.update(detail)
-                merged["id"] = int(chal_id)
+                merged["id"] = cache_key
+                merged["remote_id"] = int(chal_id) if str(chal_id).isdigit() else chal_id
                 merged["source"] = source
                 merged.setdefault("files", [])
-                items[str(chal_id)] = merged
+                items[cache_key] = merged
                 save_challenges({"updated_at": utc_now(), "items": items})
             except ISCCError as exc:
-                partial = dict(items.get(str(chal_id), {}))
+                partial = dict(items.get(cache_key, {}))
                 partial.update(chal)
+                partial["id"] = cache_key
+                partial["remote_id"] = int(chal_id) if str(chal_id).isdigit() else chal_id
                 partial["source"] = source
-                partial.setdefault("name", f"#{chal_id}")
+                partial.setdefault("name", f"#{cache_key}")
                 partial.setdefault("files", [])
-                items[str(chal_id)] = partial
-                errors.append({"chal_id": chal_id, "error": str(exc)})
+                items[cache_key] = partial
+                errors.append({"chal_id": cache_key, "error": str(exc)})
                 save_challenges({"updated_at": utc_now(), "items": items})
             sleep_between_progress_items(progress_id, delay_seconds, index, total)
         items = {chal_id: item for chal_id, item in items.items() if chal_id in seen_ids or chal_id not in challenges_data.get("items", {})}
@@ -2369,7 +2442,7 @@ def sync_run_operation(progress_id, body):
         update_progress(progress_id, 0, total, first.get("username"), f"正在同步题目：{first.get('username')}")
         client = get_ready_client(first, accounts_data, cfg)
         listed = client.list_all_challenges()
-        listed = [chal for chal in listed if not requested_ids or str(chal.get("id")) in requested_ids]
+        listed = [chal for chal in listed if not requested_ids or challenge_cache_key(challenge_source(chal), chal.get("id")) in requested_ids]
         challenges_data = load_challenges()
         items = dict(challenges_data.get("items", {}))
         for detail_index, chal in enumerate(listed, start=1):
@@ -2377,32 +2450,36 @@ def sync_run_operation(progress_id, body):
             chal_id = chal.get("id")
             if chal_id is None:
                 continue
-            name = chal.get("name") or f"#{chal_id}"
-            update_progress(progress_id, 0, total, first.get("username"), f"正在同步题目详情：{detail_index}/{len(listed)} {name}")
-            seen_ids.add(str(chal_id))
             source = challenge_source(chal)
+            cache_key = challenge_cache_key(source, chal_id)
+            name = chal.get("name") or f"#{cache_key}"
+            update_progress(progress_id, 0, total, first.get("username"), f"正在同步题目详情：{detail_index}/{len(listed)} {name}")
+            seen_ids.add(cache_key)
             try:
                 detail = client.get_challenge_detail(chal_id, source=source)
-                mark_challenge_detail_visited(first.get("id"), client, chal_id)
-                previous = items.get(str(chal_id), {})
+                mark_challenge_detail_visited(first.get("id"), client, cache_key)
+                previous = items.get(cache_key, {})
                 custom_name = previous.get("custom_name")
                 merged = dict(chal)
                 merged.update(detail)
-                merged["id"] = int(chal_id)
+                merged["id"] = cache_key
+                merged["remote_id"] = int(chal_id) if str(chal_id).isdigit() else chal_id
                 merged["source"] = source
                 if custom_name:
                     merged["custom_name"] = custom_name
                     merged["name"] = custom_name
                 merged.setdefault("files", [])
-                items[str(chal_id)] = merged
+                items[cache_key] = merged
             except ISCCError as exc:
-                partial = dict(items.get(str(chal_id), {}))
+                partial = dict(items.get(cache_key, {}))
                 partial.update(chal)
+                partial["id"] = cache_key
+                partial["remote_id"] = int(chal_id) if str(chal_id).isdigit() else chal_id
                 partial["source"] = source
                 partial.setdefault("name", name)
                 partial.setdefault("files", [])
-                items[str(chal_id)] = partial
-                errors.append({"chal_id": chal_id, "error": str(exc)})
+                items[cache_key] = partial
+                errors.append({"chal_id": cache_key, "error": str(exc)})
             sleep_between_progress_items(progress_id, delay_seconds, detail_index, len(listed))
         if requested_ids is None:
             items = {chal_id: item for chal_id, item in items.items() if chal_id in seen_ids}
@@ -2483,7 +2560,7 @@ def api_challenges():
             if q not in haystack:
                 continue
         item = apply_challenge_custom_name(challenge)
-        item["id"] = int(challenge.get("id") or chal_id)
+        item["id"] = str(challenge.get("id") or chal_id)
         item["solved"] = solved
         item["solved_by_ids"] = solved_ids
         item["solved_by"] = [{"account_id": aid, "username": account_names.get(aid, aid)} for aid in solved_ids]
@@ -2504,7 +2581,7 @@ def api_challenges():
         item["account_count"] = len(accounts_data.get("accounts", []))
         item.setdefault("files", [])
         items.append(item)
-    items.sort(key=lambda x: (str(x.get("category", "")), int(x.get("id") or 0)))
+    items.sort(key=lambda x: (str(x.get("category", "")), str(x.get("id") or "")))
     total = len(challenges_data.get("items", {}))
     solved_any = sum(1 for chal_id in challenges_data.get("items", {}) if solved_by_chal.get(str(chal_id)))
     return api_ok(
@@ -2516,7 +2593,7 @@ def api_challenges():
     )
 
 
-@app.route("/api/challenges/<int:chal_id>", methods=["PATCH"])
+@app.route("/api/challenges/<path:chal_id>", methods=["PATCH"])
 @require_auth
 def api_challenge_patch(chal_id):
     body = json_body()
@@ -2534,7 +2611,7 @@ def api_challenge_patch(chal_id):
     return api_ok(apply_challenge_custom_name(challenge))
 
 
-@app.route("/api/challenges/<int:chal_id>")
+@app.route("/api/challenges/<path:chal_id>")
 @require_auth
 def api_challenge_detail(chal_id):
     challenges_data = load_challenges()
@@ -2563,10 +2640,9 @@ def validate_submission_payload(account_id, chal_id, flag):
         return "请选择账号"
     if not chal_id:
         return "请选择题目"
-    try:
-        int(chal_id)
-    except (TypeError, ValueError):
-        return "题目 ID 必须是数字"
+    source, remote_id = split_challenge_ref(chal_id, fallback_source=cached_challenge_source(chal_id))
+    if not remote_id or source not in CHALLENGE_SOURCES:
+        return "题目 ID 无效"
     if not flag:
         return "flag 不能为空"
     return None
@@ -2662,7 +2738,7 @@ def api_submit():
     result = {
         "account_id": account_id,
         "account_username": account.get("username"),
-        "chal_id": int(chal_id),
+        "chal_id": challenge_cache_key(cached_challenge_source(chal_id), chal_id),
         "ok": True,
         "message": "",
     }
@@ -2672,7 +2748,7 @@ def api_submit():
         init_progress(progress_id, "提交 Flag", 1)
         update_progress(progress_id, 1, 1, account.get("username"), f"正在提交：{account.get('username')}")
         client = get_ready_client(account, accounts_data, cfg)
-        result.update(submit_flag_for_account(account, client, int(chal_id), flag, flags_data, md5=md5, source="single"))
+        result.update(submit_flag_for_account(account, client, chal_id, flag, flags_data, md5=md5, source="single"))
         check_progress_control(progress_id)
         save_accounts(accounts_data)
         update_progress(progress_id, 1, 1, message=result.get("message") or "提交完成", done=True, ok=result["ok"])
@@ -2682,7 +2758,7 @@ def api_submit():
                 set_account_solves(solves_data, account, client.list_all_solves())
                 save_solves(solves_data)
             except ISCCError as exc:
-                log_event("warn", "post_submit_solves_refresh_failed", account_id=account.get("id"), username=account.get("username"), chal_id=int(chal_id), error=str(exc))
+                log_event("warn", "post_submit_solves_refresh_failed", account_id=account.get("id"), username=account.get("username"), chal_id=result.get("chal_id"), error=str(exc))
         return api_ok(result)
     except ISCCError as exc:
         if exc.auth_error:
@@ -2697,7 +2773,7 @@ def api_submit():
             account_id=account_id,
             username=account.get("username"),
             proxy=client.proxy_label if client else None,
-            chal_id=int(chal_id),
+            chal_id=result.get("chal_id"),
             error=str(exc),
             flag_md5=flag_md5(flag),
             attachment_md5=md5,
@@ -2713,14 +2789,10 @@ def submit_batch_operation(progress_id, body):
         submissions = [{"chal_id": body.get("chal_id"), "flag": body.get("flag")}]
     cleaned = []
     for item in submissions:
-        chal_id = item.get("chal_id")
+        chal_id = str(item.get("chal_id") or "").strip()
         flag = str(item.get("flag") or "").strip()
-        try:
-            chal_id = int(chal_id)
-        except (TypeError, ValueError):
-            continue
-        if flag:
-            cleaned.append({"chal_id": chal_id, "flag": flag})
+        if chal_id and flag:
+            cleaned.append({"chal_id": challenge_cache_key(cached_challenge_source(chal_id), chal_id), "flag": flag})
     if not cleaned:
         raise ISCCError("请选择题目并输入 flag")
     
@@ -2897,7 +2969,7 @@ def files_update_operation(progress_id, body):
             account_challenges = list(selected_challenges)
             if not account_challenges:
                 listed = client.list_all_challenges()
-                listed_map = {str(chal.get("id")): chal for chal in listed if chal.get("id") is not None}
+                listed_map = {challenge_cache_key(challenge_source(chal), chal.get("id")): chal for chal in listed if chal.get("id") is not None}
                 wanted_ids = chal_ids or set(listed_map.keys())
                 account_challenges = [(chal_id, listed_map.get(str(chal_id), {"id": chal_id, "name": f"#{chal_id}"})) for chal_id in wanted_ids if str(chal_id) in listed_map or chal_ids]
             if not account_challenges:
@@ -2922,7 +2994,7 @@ def files_update_operation(progress_id, body):
                     else:
                         detail = refresh_challenge_detail_for_account(client, chal_id, fallback=challenge, account_id=account.get("id"))
                         mark_challenge_detail_visited(account.get("id"), client, chal_id)
-                    detail.setdefault("id", int(chal_id) if str(chal_id).isdigit() else chal_id)
+                    detail.setdefault("id", str(chal_id))
                     detail.setdefault("name", challenge.get("name") or f"#{chal_id}")
                     detail.setdefault("category", challenge.get("category"))
                     if not detail.get("files"):
