@@ -1076,18 +1076,21 @@ class ISCCClient:
                 raise ISCCError("登录失败：ISCC 仍返回登录页，请检查账号密码或比赛登录状态", auth_error=True)
             self.nonce = self.get_nonce()
             challenges = self.list_challenges_once()
-            if not isinstance(challenges, list):
+            arenas = self.list_challenges_once(CHALLENGE_SOURCE_ARENA)
+            if not isinstance(challenges, list) or not isinstance(arenas, list):
                 self.logged_in = False
                 raise ISCCError("登录校验失败：无法读取题目列表")
             self.logged_in = True
             return True
 
-    def get_nonce(self):
+    def get_nonce(self, source=CHALLENGE_SOURCE_DEFAULT):
+        source = normalize_challenge_source(source)
+        page_path = challenge_endpoint(source, "referer")
         with self.lock:
-            response = self.request("GET", "/challenges")
+            response = self.request("GET", page_path)
             html = response.text or ""
             if not html.strip():
-                raise ISCCError("获取 nonce 失败：/challenges 返回空内容", auth_error=True)
+                raise ISCCError(f"获取 nonce 失败：{page_path} 返回空内容", auth_error=True)
             if looks_like_login_page(html):
                 raise ISCCError("登录失败：ISCC 仍返回登录页，请检查账号密码或比赛登录状态", auth_error=True)
             patterns = [
@@ -1129,7 +1132,7 @@ class ISCCClient:
         submit_path = challenge_endpoint(source, "submit").format(id=chal_id)
         for payload_mode in payload_modes():
             if not self.nonce:
-                self.nonce = self.get_nonce()
+                self.nonce = self.get_nonce(source)
             payload = {"key": flag, "nonce": self.nonce}
             try:
                 response = self.request("POST", submit_path, headers=headers, **{payload_mode: payload})
@@ -1741,7 +1744,7 @@ def submit_flag_for_account(account, client, chal_id, flag, flags_data, md5="", 
         attachment_md5=md5,
     )
     if row["ok"]:
-        record_successful_flag(flags_data, account, int(chal_id), flag, md5=md5, source=source, message=row.get("message"))
+        record_successful_flag(flags_data, account, int(chal_id), flag, md5=md5, source=challenge_track, message=row.get("message"))
         save_flags(flags_data)
     return row
 
@@ -2049,6 +2052,7 @@ def api_accounts_test_login_all():
     if not accounts:
         return api_error("没有可用账号")
     results = []
+    sync_account_ids = []
     total = len(accounts)
     init_progress(progress_id, "登录所选账号", total)
     for index, account in enumerate(accounts, start=1):
@@ -2066,11 +2070,16 @@ def api_accounts_test_login_all():
             save_accounts(accounts_data)
             continue
         results.append({"account_id": account["id"], "username": account.get("username"), "ok": True, "last_login_at": account.get("last_login_at")})
+        sync_account_ids.append(account["id"])
         add_progress_event(progress_id, account.get("username"), True, "登录成功")
         save_accounts(accounts_data)
+    sync_result = None
+    if sync_account_ids:
+        update_progress(progress_id, total, total, message="登录完成，正在自动同步全部内容")
+        sync_result = sync_run_operation(progress_id, {"account_ids": sync_account_ids})
     save_accounts(accounts_data)
-    update_progress(progress_id, total, total, message="登录完成", done=True, ok=True)
-    return api_ok({"results": results})
+    update_progress(progress_id, total, total, message="登录完成，已自动同步全部内容" if sync_account_ids else "登录完成", done=True, ok=True)
+    return api_ok({"results": results, "sync": sync_result})
 
 
 @app.route("/api/accounts/<account_id>/test-login", methods=["POST"])
@@ -2088,8 +2097,10 @@ def api_account_test_login(account_id):
         update_progress(progress_id, 1, 1, account.get("username"), f"正在登录 {account.get('username')}")
         refresh_account_after_login(account, accounts_data, cfg, progress_id=progress_id, force=True)
         add_progress_event(progress_id, account.get("username"), True, "登录成功，已更新解题状态")
-        update_progress(progress_id, 1, 1, message="登录完成", done=True, ok=True)
-        return api_ok({"username": account.get("username"), "last_login_at": account.get("last_login_at")})
+        update_progress(progress_id, 1, 1, message="登录完成，正在自动同步全部内容")
+        sync_result = sync_run_operation(progress_id, {"account_ids": [account_id]})
+        update_progress(progress_id, 1, 1, message="登录完成，已自动同步全部内容", done=True, ok=True)
+        return api_ok({"username": account.get("username"), "last_login_at": account.get("last_login_at"), "sync": sync_result})
     except ISCCError as exc:
         save_accounts(accounts_data)
         add_progress_event(progress_id, account.get("username"), False, f"登录失败：{exc}")
