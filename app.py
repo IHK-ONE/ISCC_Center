@@ -1360,7 +1360,7 @@ class ISCCClient:
             items.extend(self.list_solves(source))
         return items
 
-    def download_challenge_files(self, account_id, challenge_info):
+    def download_challenge_files(self, account_id, challenge_info, reusable_by_source=None):
         with self.lock:
             source = challenge_source(challenge_info)
             display_category = challenge_display_category(challenge_info)
@@ -1382,33 +1382,28 @@ class ISCCClient:
                 original_name = sanitize_name(Path(unquote(urlparse(source_url).path)).name, f"attachment-{chal_id}")
                 source_stem = sanitize_name(Path(original_name).stem, f"attachment-{chal_id}")
                 challenge_dir = DOWNLOAD_DIR / source_stem
-                reused = reusable_file_by_source(source_url)
+                reused = reusable_file_by_source(source_url, reusable_by_source=reusable_by_source)
                 if reused:
                     file_md5 = str(reused.get("md5") or "")
                     stored_name = reused.get("stored_name") or Path(reused.get("path") or "").name
                     final_path = Path(reused.get("path") or "")
                     size = int(reused.get("size") or final_path.stat().st_size)
-                    file_id = hashlib.sha256(
-                        f"{account_id}|{chal_id}|{source_url}|{file_md5}|{stored_name}".encode("utf-8")
-                    ).hexdigest()[:24]
                     results.append(
-                        {
-                            "file_id": file_id,
-                            "account_id": account_id,
-                            "account_username": self.username,
-                            "challenge_id": chal_id,
-                            "challenge_name": chal_name,
-                            "category": display_category,
-                            "source": source,
-                            "source_url": source_url,
-                            "original_name": original_name,
-                            "stored_name": stored_name,
-                            "path": str(final_path),
-                            "md5": file_md5,
-                            "size": size,
-                            "updated_at": utc_now(),
-                            "reused": True,
-                        }
+                        download_file_record(
+                            account_id,
+                            self.username,
+                            chal_id,
+                            chal_name,
+                            display_category,
+                            source,
+                            source_url,
+                            original_name,
+                            stored_name,
+                            final_path,
+                            file_md5,
+                            size,
+                            reused=True,
+                        )
                     )
                     continue
                 challenge_dir.mkdir(parents=True, exist_ok=True)
@@ -1434,26 +1429,21 @@ class ISCCClient:
                         tmp_path.unlink(missing_ok=True)
                     else:
                         tmp_path.replace(final_path)
-                    file_id = hashlib.sha256(
-                        f"{account_id}|{chal_id}|{source_url}|{file_md5}|{stored_name}".encode("utf-8")
-                    ).hexdigest()[:24]
                     results.append(
-                        {
-                            "file_id": file_id,
-                            "account_id": account_id,
-                            "account_username": self.username,
-                            "challenge_id": chal_id,
-                            "challenge_name": chal_name,
-                            "category": display_category,
-                            "source": source,
-                            "source_url": source_url,
-                            "original_name": original_name,
-                            "stored_name": stored_name,
-                            "path": str(final_path),
-                            "md5": file_md5,
-                            "size": size,
-                            "updated_at": utc_now(),
-                        }
+                        download_file_record(
+                            account_id,
+                            self.username,
+                            chal_id,
+                            chal_name,
+                            display_category,
+                            source,
+                            source_url,
+                            original_name,
+                            stored_name,
+                            final_path,
+                            file_md5,
+                            size,
+                        )
                     )
                 finally:
                     if tmp_path.exists():
@@ -1611,17 +1601,54 @@ def attachment_md5_map(files_data):
     return md5_by_key
 
 
-def reusable_file_by_source(source_url):
-    source_url = str(source_url or "")
-    if not source_url:
-        return None
-    for item in flatten_files(load_files()):
-        if item.get("source_url") != source_url or not item.get("md5"):
+def download_file_record(account_id, account_username, chal_id, chal_name, category, source, source_url, original_name, stored_name, path, file_md5, size, reused=False):
+    file_id = hashlib.sha256(
+        f"{account_id}|{chal_id}|{source_url}|{file_md5}|{stored_name}".encode("utf-8")
+    ).hexdigest()[:24]
+    row = {
+        "file_id": file_id,
+        "account_id": account_id,
+        "account_username": account_username,
+        "challenge_id": chal_id,
+        "challenge_name": chal_name,
+        "category": category,
+        "source": source,
+        "source_url": source_url,
+        "original_name": original_name,
+        "stored_name": stored_name,
+        "path": str(path),
+        "md5": file_md5,
+        "size": size,
+        "updated_at": utc_now(),
+    }
+    if reused:
+        row["reused"] = True
+    return row
+
+
+def reusable_file_index(files_data=None):
+    rows = {}
+    for item in flatten_files(files_data or load_files()):
+        source_url = str(item.get("source_url") or "")
+        if not source_url or not item.get("md5"):
             continue
         path = Path(item.get("path") or "")
         if path.exists() and path.is_file():
-            return item
-    return None
+            rows.setdefault(source_url, item)
+    return rows
+
+
+def reusable_file_by_source(source_url, reusable_by_source=None):
+    source_url = str(source_url or "")
+    if not source_url:
+        return None
+    if reusable_by_source is None:
+        reusable_by_source = reusable_file_index()
+    item = reusable_by_source.get(source_url)
+    if not item:
+        return None
+    path = Path(item.get("path") or "")
+    return item if path.exists() and path.is_file() else None
 
 
 def existing_account_file_by_source(files_data, account_id, chal_id, source_url):
@@ -1635,17 +1662,6 @@ def existing_account_file_by_source(files_data, account_id, chal_id, source_url)
             row["skipped"] = True
             return row
     return None
-
-
-def file_path_is_referenced(files_data, path, exclude_file_ids=None):
-    exclude_file_ids = set(exclude_file_ids or [])
-    target = str(path)
-    for item in flatten_files(files_data):
-        if item.get("file_id") in exclude_file_ids:
-            continue
-        if str(item.get("path") or "") == target:
-            return True
-    return False
 
 
 def cleanup_empty_download_dirs():
@@ -2623,7 +2639,7 @@ def api_challenges():
         item["account_count"] = len(accounts_data.get("accounts", []))
         item.setdefault("files", [])
         items.append(item)
-    items.sort(key=lambda x: (str(x.get("category", "")), str(x.get("id") or "")))
+    items.sort(key=lambda x: (str(x.get("category", "")), challenge_sort_key(x.get("id"))))
     total = len(challenges_data.get("items", {}))
     solved_any = sum(1 for chal_id in challenges_data.get("items", {}) if solved_by_chal.get(str(chal_id)))
     return api_ok(
@@ -2987,6 +3003,8 @@ def files_update_operation(progress_id, body):
     selected_challenges = [(chal_id, challenge) for chal_id, challenge in challenges.items() if not chal_ids or str(chal_id) in chal_ids]
     
     files_data = load_files()
+    reusable_by_source = reusable_file_index(files_data)
+    files_changed = False
     solves_data = load_solves()
     solves_changed = False
     results = []
@@ -3041,9 +3059,8 @@ def files_update_operation(progress_id, body):
                     detail.setdefault("category", challenge_display_category(challenge))
                     if not detail.get("files"):
                         skipped_count += 1
-                        account_files.pop(str(chal_id), None)
-                        files_data["updated_at"] = utc_now()
-                        save_files(files_data)
+                        if account_files.pop(str(chal_id), None) is not None:
+                            files_changed = True
                         add_progress_event(progress_id, account.get("username"), True, f"{challenge_name}：无附件，已跳过", kind="files", account_id=account.get("id"), chal_id=chal_id)
                         log_event("info", "file_update_no_account_file", account_id=account.get("id"), username=account.get("username"), chal_id=chal_id, message="当前账号该题没有附件")
                         continue
@@ -3061,17 +3078,20 @@ def files_update_operation(progress_id, body):
                             missing_sources.append(source_path)
                     download_detail = dict(detail)
                     download_detail["files"] = missing_sources
-                    downloaded = client.download_challenge_files(account["id"], download_detail) if missing_sources else []
+                    downloaded = client.download_challenge_files(account["id"], download_detail, reusable_by_source=reusable_by_source) if missing_sources else []
                     final_rows = existing_rows + downloaded
                     if final_rows:
                         account_files[str(chal_id)] = final_rows
+                        files_changed = True
+                        for item in final_rows:
+                            if item.get("source_url") and item.get("md5"):
+                                reusable_by_source.setdefault(str(item.get("source_url")), item)
                         downloaded_count += len([item for item in downloaded if not item.get("reused")])
                         skipped_count += len(existing_rows) + len([item for item in downloaded if item.get("reused")])
                     else:
                         skipped_count += 1
-                        account_files.pop(str(chal_id), None)
-                    files_data["updated_at"] = utc_now()
-                    save_files(files_data)
+                        if account_files.pop(str(chal_id), None) is not None:
+                            files_changed = True
                     add_progress_event(progress_id, account.get("username"), True, f"{challenge_name}：下载 {len([item for item in downloaded if not item.get('reused')])}，跳过/复用 {len(existing_rows) + len([item for item in downloaded if item.get('reused')])}", kind="files", account_id=account.get("id"), chal_id=chal_id)
                 except ISCCError as exc:
                     log_event("warn", "file_update_challenge_failed", account_id=account.get("id"), username=account.get("username"), chal_id=chal_id, error=str(exc))
@@ -3102,8 +3122,9 @@ def files_update_operation(progress_id, body):
             )
             save_accounts(accounts_data)
         sleep_between_progress_items(progress_id, delay_seconds, index, total)
-    files_data["updated_at"] = utc_now()
-    save_files(files_data)
+    if files_changed:
+        files_data["updated_at"] = utc_now()
+        save_files(files_data)
     if solves_changed:
         save_solves(solves_data)
     save_accounts(accounts_data)
@@ -3155,8 +3176,9 @@ def delete_file_records(file_ids):
                 chal_map.pop(chal_id, None)
         if not chal_map:
             files_data.get("accounts", {}).pop(account_id, None)
+    referenced_paths = {str(item.get("path") or "") for item in flatten_files(files_data) if item.get("path")}
     for path in paths_to_check:
-        if path.exists() and path.is_file() and not file_path_is_referenced(files_data, path):
+        if path.exists() and path.is_file() and str(path) not in referenced_paths:
             downloads_root = DOWNLOAD_DIR.resolve()
             resolved = path.resolve()
             if downloads_root in resolved.parents or resolved == downloads_root:

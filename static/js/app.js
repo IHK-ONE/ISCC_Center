@@ -12,6 +12,7 @@ const state = {
   flags: [],
   logs: [],
   logsTimer: null,
+  logsInFlight: false,
   logsPage: { page: 1, pageSize: 50, total: 0 },
   seenLogToasts: new Set(),
   loginAccountIds: [],
@@ -61,6 +62,14 @@ function challengeDisplayId(item) {
   const id = String(item?.id ?? item?.challenge_id ?? '');
   if (!id || id.includes(':')) return id;
   return `${source}:${id}`;
+}
+
+function challengeLookup() {
+  return new Map(state.challenges.map(item => [String(item.id), item]));
+}
+
+function challengeById(id) {
+  return state.challenges.find(item => String(item.id) === String(id));
 }
 
 function sourceSelectOptions(selected) {
@@ -182,7 +191,7 @@ async function loadData() {
 
 async function refreshKinds(kinds, render=true) {
   const uniqueKinds = [...new Set(kinds)];
-  for (const kind of uniqueKinds) await refreshLocalKind(kind, false);
+  await Promise.all(uniqueKinds.map(kind => refreshLocalKind(kind, false)));
   if (render) renderCurrentViewForKinds(uniqueKinds) || renderMainOrApp();
 }
 
@@ -262,12 +271,13 @@ async function refreshLocalKind(kind, render=true) {
 }
 
 async function refreshRealtimeKinds(kinds) {
-  const nextKinds = new Set(kinds);
-  for (const kind of kinds) {
-    await refreshLocalKind(kind, false);
-    if (kind === 'logs' && state.logs.some(log => log.event === 'proxy_removed')) nextKinds.add('config');
+  const uniqueKinds = [...new Set(kinds)];
+  const nextKinds = new Set(uniqueKinds);
+  await Promise.all(uniqueKinds.map(kind => refreshLocalKind(kind, false)));
+  if (uniqueKinds.includes('logs') && state.logs.some(log => log.event === 'proxy_removed')) {
+    nextKinds.add('config');
+    await refreshLocalKind('config', false);
   }
-  if (nextKinds.has('config')) await refreshLocalKind('config', false);
   renderCurrentViewForKinds([...nextKinds]);
 }
 
@@ -281,12 +291,18 @@ function startRealtimeRefresh(kinds, interval=1200) {
       return;
     }
     refreshLocalKind(kind, false).catch(() => {});
-    state.realtimeTimers[kind] = {
-      refs: 1,
-      timer: setInterval(() => {
-        refreshRealtimeKinds([kind]).catch(() => {});
-      }, interval)
-    };
+    const timerEntry = { refs: 1, timer: null, inFlight: false };
+    timerEntry.timer = setInterval(async () => {
+      if (timerEntry.inFlight) return;
+      timerEntry.inFlight = true;
+      try {
+        await refreshRealtimeKinds([kind]);
+      } catch (err) {
+      } finally {
+        timerEntry.inFlight = false;
+      }
+    }, interval);
+    state.realtimeTimers[kind] = timerEntry;
     changed = true;
   });
   if (changed) updateProgressDock();
@@ -375,7 +391,10 @@ function watchProgress(progress_id, onDone=null) {
   if (!progress_id) return;
   if (onDone) state.progressDoneHandlers[progress_id] = onDone;
   if (state.progressTimers[progress_id]) return;
+  let inFlight = false;
   state.progressTimers[progress_id] = setInterval(async () => {
+    if (inFlight) return;
+    inFlight = true;
     try {
       const data = await api(`/api/progress/${progress_id}`);
       showProgressEvents(progress_id, data.events || []);
@@ -395,7 +414,10 @@ function watchProgress(progress_id, onDone=null) {
         if (doneHandler) await doneHandler(data);
         finishProgressSoon(progress_id);
       }
-    } catch (err) {}
+    } catch (err) {
+    } finally {
+      inFlight = false;
+    }
   }, 500);
 }
 
@@ -640,7 +662,7 @@ function renderAccountsPage() {
     </div>
     <div class="card" style="margin-top:16px">
       <div class="table-wrap"><table><thead><tr><th>选择</th><th>账号</th><th>密码</th><th>登录状态 / 最近登录</th><th>错误</th><th>操作</th></tr></thead><tbody>
-        ${state.accounts.map(a => `<tr><td><input class="loginAccount" type="checkbox" value="${h(a.id)}" ${isLoginAccountSelected(a.id) ? 'checked' : ''} ${accountBusy ? 'disabled' : ''} onchange="syncLoginSelectionFromDom()"></td><td><strong>${h(a.username)}</strong></td><td>${a.password_set ? '<span class="pill">已存密码</span>' : '<span class="pill bad">无密码</span>'}</td><td>${a.last_login_ok === true ? '<span class="pill good">成功</span>' : a.last_login_ok === false ? '<span class="pill bad">失败</span>' : '<span class="pill">未登录</span>'}<br><span class="muted">${h(a.last_login_at || '-')}</span></td><td class="muted">${h(a.last_error || '-')}</td><td><div class="row-actions"><button onclick="loginAccount('${a.id}')" ${accountBusy ? 'disabled' : ''}>登录</button><button class="danger" onclick="deleteAccount('${a.id}')" ${accountBusy ? 'disabled' : ''}>删除</button></div></td></tr>`).join('') || '<tr><td colspan="6" class="muted">暂无账号</td></tr>'}
+        ${state.accounts.map(a => `<tr><td><input class="loginAccount" type="checkbox" value="${h(a.id)}" ${isLoginAccountSelected(a.id) ? 'checked' : ''} ${accountBusy ? 'disabled' : ''} onchange="syncLoginSelectionFromDom()"></td><td><strong>${h(a.username)}</strong></td><td>${a.password_set ? '<span class="pill">已存密码</span>' : '<span class="pill bad">无密码</span>'}</td><td>${a.last_login_ok === true ? '<span class="pill good">成功</span>' : a.last_login_ok === false ? '<span class="pill bad">失败</span>' : '<span class="pill">未登录</span>'}<br><span class="muted">${h(a.last_login_at || '-')}</span></td><td class="muted">${h(a.last_error || '-')}</td><td><div class="row-actions"><button onclick="loginAccount('${h(a.id)}')" ${accountBusy ? 'disabled' : ''}>登录</button><button class="danger" onclick="deleteAccount('${h(a.id)}')" ${accountBusy ? 'disabled' : ''}>删除</button></div></td></tr>`).join('') || '<tr><td colspan="6" class="muted">暂无账号</td></tr>'}
       </tbody></table></div>
     </div>`;
 }
@@ -648,7 +670,7 @@ function renderAccountsPage() {
 function challengesTableHtml() {
   const filtered = filteredChallenges();
   return `<div class="table-wrap"><table><thead><tr><th>ID</th><th>题目</th><th>分类</th><th>分值</th><th>已解用户</th><th>未解用户</th><th>访问状态</th><th>附件</th><th>操作</th></tr></thead><tbody>
-    ${filtered.map(c => `<tr><td>${h(challengeDisplayId(c))}</td><td><strong>${h(c.name || '未命名')}</strong> <span class="pill">${h(c.source_label || challengeSourceLabel(challengeSourceValue(c)))}</span> <button class="ghost rename-btn" onclick="renameChallenge('${h(c.id)}')">重命名</button><br><span class="muted">解出次数：${h(c.solves ?? '-')}</span></td><td><span class="pill">${h(c.category || '-')}</span></td><td>${h(c.value ?? '-')}</td><td>${renderUserChips(c.solved_by || [], 'good', `solved-${c.id}`)}</td><td>${renderUserChips(c.unsolved_by || [], 'bad', `unsolved-${c.id}`)}</td><td><span class="pill ${Number(c.visit_count || 0) >= Number(c.account_count || state.accounts.length || 0) ? 'good' : 'warn'}">${h(c.visit_count || 0)}/${h(c.account_count || state.accounts.length || 0)}</span><br>${renderUserChips(c.unvisited_by || [], 'warn', `unvisited-${c.id}`)}</td><td>${(c.files || []).length} 个</td><td><button onclick="openChallenge('${c.id}')">详情</button></td></tr>`).join('') || '<tr><td colspan="9" class="muted">暂无题目，先同步题目。</td></tr>'}
+    ${filtered.map(c => `<tr><td>${h(challengeDisplayId(c))}</td><td><strong>${h(c.name || '未命名')}</strong> <span class="pill">${h(c.source_label || challengeSourceLabel(challengeSourceValue(c)))}</span> <button class="ghost rename-btn" onclick="renameChallenge('${h(c.id)}')">重命名</button><br><span class="muted">解出次数：${h(c.solves ?? '-')}</span></td><td><span class="pill">${h(c.category || '-')}</span></td><td>${h(c.value ?? '-')}</td><td>${renderUserChips(c.solved_by || [], 'good', `solved-${c.id}`)}</td><td>${renderUserChips(c.unsolved_by || [], 'bad', `unsolved-${c.id}`)}</td><td><span class="pill ${Number(c.visit_count || 0) >= Number(c.account_count || state.accounts.length || 0) ? 'good' : 'warn'}">${h(c.visit_count || 0)}/${h(c.account_count || state.accounts.length || 0)}</span><br>${renderUserChips(c.unvisited_by || [], 'warn', `unvisited-${c.id}`)}</td><td>${(c.files || []).length} 个</td><td><button onclick="openChallenge('${h(c.id)}')">详情</button></td></tr>`).join('') || '<tr><td colspan="9" class="muted">暂无题目，先同步题目。</td></tr>'}
   </tbody></table></div>`;
 }
 
@@ -717,7 +739,7 @@ function selectedChallengeId(kind) {
 
 function submittedAccountIds(chalId) {
   const ids = new Set();
-  const c = state.challenges.find(item => String(item.id) === String(chalId));
+  const c = challengeById(chalId);
   (c?.solved_by_ids || []).forEach(id => ids.add(id));
   state.flags.filter(item => String(item.chal_id) === String(chalId)).forEach(item => item.account_id && ids.add(item.account_id));
   return ids;
@@ -783,17 +805,17 @@ function filteredChallenges() {
 
 function flagManagementTableHtml() {
   const q = state.flagFilters.q.trim().toLowerCase();
-  const visibleFlags = challengeFlags('').filter(f => {
-    const challenge = state.challenges.find(item => String(item.id) === String(f.chal_id));
+  const challengesById = challengeLookup();
+  const visibleFlags = challengeFlags('').map(flag => ({ flag, challenge: challengesById.get(String(flag.chal_id)) })).filter(({ flag, challenge }) => {
     if (state.flagFilters.category && challenge?.category !== state.flagFilters.category) return false;
-    if (state.flagFilters.chal && String(f.chal_id) !== String(state.flagFilters.chal)) return false;
+    if (state.flagFilters.chal && String(flag.chal_id) !== String(state.flagFilters.chal)) return false;
     if (q) {
-      const hay = `${f.chal_id} ${challenge?.name || ''} ${challenge?.category || ''} ${f.flag || ''} ${f.attachment_md5 || ''}`.toLowerCase();
+      const hay = `${flag.chal_id} ${challenge?.name || ''} ${challenge?.category || ''} ${flag.flag || ''} ${flag.attachment_md5 || ''}`.toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
   });
-  return `<table><thead><tr><th>题目</th><th>分类</th><th>Flag</th><th>附件 MD5</th><th>时间</th></tr></thead><tbody>${visibleFlags.map(f => { const challenge = state.challenges.find(item => String(item.id) === String(f.chal_id)); return `<tr><td>${h(challengeName(f.chal_id))}</td><td><span class="pill">${h(challenge?.category || '-')}</span></td><td><span class="kbd">${h(f.flag)}</span></td><td><span class="kbd">${h(f.attachment_md5 || '-')}</span></td><td>${h(f.updated_at || f.created_at || '-')}</td></tr>`; }).join('') || '<tr><td colspan="5" class="muted">当前筛选暂无已保存 flag</td></tr>'}</tbody></table>`;
+  return `<table><thead><tr><th>题目</th><th>分类</th><th>Flag</th><th>附件 MD5</th><th>时间</th></tr></thead><tbody>${visibleFlags.map(({ flag, challenge }) => `<tr><td>${h(challengeName(flag.chal_id, challenge))}</td><td><span class="pill">${h(challenge?.category || '-')}</span></td><td><span class="kbd">${h(flag.flag)}</span></td><td><span class="kbd">${h(flag.attachment_md5 || '-')}</span></td><td>${h(flag.updated_at || flag.created_at || '-')}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">当前筛选暂无已保存 flag</td></tr>'}</tbody></table>`;
 }
 
 function renderFlagManagementTable() {
@@ -864,10 +886,11 @@ function filesFilterHtml() {
 }
 
 function filesTableHtml() {
-  const files = filteredFiles();
+  const challengesById = challengeLookup();
+  const files = filteredFiles(challengesById);
   return `<div class="toolbar"><span class="muted">共 ${files.length}/${state.files.length} 个附件记录。原始下载只会打开当前筛选结果里的 ISCC 原始链接。</span></div>
   <div class="table-wrap"><table><thead><tr><th>账号</th><th>题目</th><th>原文件</th><th>保存文件</th><th>大小</th><th>MD5</th><th>更新时间</th><th>操作</th></tr></thead><tbody>
-    ${files.map(f => `<tr><td>${h(f.account_username || f.account_id)}</td><td><strong>${h(fileDisplayChallengeName(f))}</strong> <span class="pill">${h(f.source_label || challengeSourceLabel(f.source))}</span><br><span class="muted">#${h(challengeDisplayId(f) || '-')}</span></td><td>${h(f.original_name)}</td><td class="kbd">${h(f.stored_name)}</td><td>${formatSize(f.size)}</td><td><span class="kbd">${h(f.md5 || '-')}</span></td><td>${h(f.updated_at || '-')}</td><td><div class="row-actions">${f.source_url ? `<a class="pill" href="${h(f.source_url)}" target="_blank" rel="noopener noreferrer">下载原始</a>` : '<span class="pill">无链接</span>'}<button class="danger" onclick="deleteFileRecord('${h(f.file_id)}')">删除</button></div></td></tr>`).join('') || '<tr><td colspan="8" class="muted">暂无附件记录。</td></tr>'}
+    ${files.map(f => { const challenge = challengesById.get(String(f.challenge_id)); return `<tr><td>${h(f.account_username || f.account_id)}</td><td><strong>${h(fileDisplayChallengeName(f, challenge))}</strong> <span class="pill">${h(f.source_label || challengeSourceLabel(f.source))}</span><br><span class="muted">#${h(challengeDisplayId(f) || '-')}</span></td><td>${h(f.original_name)}</td><td class="kbd">${h(f.stored_name)}</td><td>${formatSize(f.size)}</td><td><span class="kbd">${h(f.md5 || '-')}</span></td><td>${h(f.updated_at || '-')}</td><td><div class="row-actions">${f.source_url ? `<a class="pill" href="${h(f.source_url)}" target="_blank" rel="noopener noreferrer">下载原始</a>` : '<span class="pill">无链接</span>'}<button class="danger" onclick="deleteFileRecord('${h(f.file_id)}')">删除</button></div></td></tr>`; }).join('') || '<tr><td colspan="8" class="muted">暂无附件记录。</td></tr>'}
   </tbody></table></div>`;
 }
 
@@ -900,10 +923,10 @@ function renderFilesPage() {
     </div>`;
 }
 
-function filteredFiles() {
+function filteredFiles(challengesById=challengeLookup()) {
   const q = state.fileFilters.q.trim().toLowerCase();
   return state.files.filter(f => {
-    const challenge = state.challenges.find(item => String(item.id) === String(f.challenge_id));
+    const challenge = challengesById.get(String(f.challenge_id));
     const source = challenge ? challengeSourceValue(challenge) : String(f.source || 'challenge');
     if (state.fileFilters.account && f.account_id !== state.fileFilters.account) return false;
     if (state.fileFilters.source && source !== state.fileFilters.source) return false;
@@ -1009,10 +1032,14 @@ function updateLogsPolling() {
 }
 
 async function refreshLogs(showError=true) {
+  if (state.logsInFlight) return;
+  state.logsInFlight = true;
   try {
     await refreshLocalKind('logs', state.tab === 'logs');
   } catch (err) {
     if (showError) toast(err.message);
+  } finally {
+    state.logsInFlight = false;
   }
 }
 
@@ -1036,18 +1063,18 @@ function fileChallengeName(name, chalId) {
   return name && name !== `#${chalId}` ? name : `题目 ${chalId}`;
 }
 
-function challengeTitle(chalId) {
-  const c = state.challenges.find(item => String(item.id) === String(chalId));
+function challengeTitle(chalId, challenge=null) {
+  const c = challenge || challengeById(chalId);
   return c ? fileChallengeName(c.name, challengeDisplayId(c)) : chalId;
 }
 
-function challengeName(chalId) {
-  const c = state.challenges.find(item => String(item.id) === String(chalId));
-  return c ? `${challengeTitle(chalId)}（#${challengeDisplayId(c)}）` : chalId;
+function challengeName(chalId, challenge=null) {
+  const c = challenge || challengeById(chalId);
+  return c ? `${challengeTitle(chalId, c)}（#${challengeDisplayId(c)}）` : chalId;
 }
 
-function fileDisplayChallengeName(file) {
-  const c = state.challenges.find(item => String(item.id) === String(file.challenge_id));
+function fileDisplayChallengeName(file, challenge=null) {
+  const c = challenge || challengeById(file.challenge_id);
   return c ? fileChallengeName(c.name, challengeDisplayId(c)) : fileChallengeName(file.challenge_name, challengeDisplayId(file));
 }
 
@@ -1196,7 +1223,7 @@ function renderModal() {
 
 function renderChallengeModal() {
   if (!state.modalChallenge) return '';
-  const c = state.challenges.find(x => String(x.id) === String(state.modalChallenge));
+  const c = challengeById(state.modalChallenge);
   if (!c) return '';
   const files = state.files.filter(f => String(f.challenge_id) === String(c.id));
   return `<div class="modal-backdrop" onclick="closeModal(event)"><div class="modal" onclick="event.stopPropagation()">
@@ -1218,7 +1245,7 @@ function renderOperationPanel() {
   const accountChecks = state.accounts.map(account => `<label class="check account-check"><input type="checkbox" class="opAccount" value="${h(account.id)}" ${panel.accountIds.includes(account.id) ? 'checked' : ''}> <span>${h(account.username)}</span></label>`).join('');
   const operationChallengeIds = panel.type === 'files' ? filteredChallengeIdsFromFileView().filter(id => panel.challengeIds.includes(id)) : panel.challengeIds;
   const challengeChecks = operationChallengeIds.map(id => {
-    const challenge = state.challenges.find(item => String(item.id) === String(id));
+    const challenge = challengeById(id);
     return `<label class="check"><input type="checkbox" class="opChallenge" value="${h(id)}" checked> <span>${h(challenge?.name || `#${id}`)}</span><small>#${h(id)}</small></label>`;
   }).join('') || '<p class="muted">当前筛选没有题目，将由后端按账号刷新可用题目。</p>';
   return `<div class="modal-backdrop"><div class="modal operation-modal">
@@ -1245,7 +1272,7 @@ function openChallenge(id) {
 }
 
 async function renameChallenge(id) {
-  const current = state.challenges.find(challenge => String(challenge.id) === String(id));
+  const current = challengeById(id);
   const name = prompt('请输入新的题目名称', current?.name || '');
   if (name === null) return;
   const trimmed = name.trim();
@@ -1447,17 +1474,20 @@ async function syncAll(options={}) {
     if (!account_ids.length) throw new Error('当前筛选没有可同步账号');
     const chal_ids = Object.prototype.hasOwnProperty.call(options, 'challengeIds') ? options.challengeIds : filteredChallengeIdsFromChallengeView();
     progress_id = startProgress('同步题目与题解', account_ids.length);
-    await api('/api/sync/run', { method: 'POST', body: { account_ids, chal_ids, progress_id } });
     watchProgress(progress_id, async data => {
-      await refreshKinds(['accounts', 'challenges', 'files', 'flags', 'logs'], true);
-      toast(data.ok === false ? (data.message || '同步失败') : '同步完成', data.ok === false ? 'warn' : 'success');
+      try {
+        await refreshKinds(['accounts', 'challenges', 'files', 'flags', 'logs'], true);
+        toast(data.ok === false ? (data.message || '同步失败') : '同步完成', data.ok === false ? 'warn' : 'success');
+      } finally {
+        stopRealtimeRefresh(startedRealtime);
+      }
     });
+    await api('/api/sync/run', { method: 'POST', body: { account_ids, chal_ids, progress_id } });
     toast('同步任务已在后台开始', 'success');
   } catch (err) {
+    stopRealtimeRefresh(startedRealtime);
     stopProgress(progress_id, true);
     toast(err.message);
-  } finally {
-    stopRealtimeRefresh(startedRealtime);
   }
 }
 
@@ -1472,17 +1502,20 @@ async function updateFiles(options={}) {
     const body = { account_ids, chal_ids };
     progress_id = startProgress('按筛选更新附件', account_ids.length);
     body.progress_id = progress_id;
-    await api('/api/files/update', { method: 'POST', body });
     watchProgress(progress_id, async data => {
-      await refreshKinds(['accounts', 'challenges', 'files', 'flags', 'logs'], true);
-      toast(data.ok === false ? (data.message || '附件更新失败') : '附件更新完成', data.ok === false ? 'warn' : 'success');
+      try {
+        await refreshKinds(['accounts', 'challenges', 'files', 'flags', 'logs'], true);
+        toast(data.ok === false ? (data.message || '附件更新失败') : '附件更新完成', data.ok === false ? 'warn' : 'success');
+      } finally {
+        stopRealtimeRefresh(startedRealtime);
+      }
     });
+    await api('/api/files/update', { method: 'POST', body });
     toast('附件更新已在后台开始', 'success');
   } catch (err) {
+    stopRealtimeRefresh(startedRealtime);
     stopProgress(progress_id, true);
     toast(err.message);
-  } finally {
-    stopRealtimeRefresh(startedRealtime);
   }
 }
 
@@ -1550,18 +1583,21 @@ async function batchSubmit() {
     };
     progress_id = startProgress('批量提交 Flag', account_ids.length);
     body.progress_id = progress_id;
+    watchProgress(progress_id, async data => {
+      try {
+        await refreshKinds(['accounts', 'challenges', 'files', 'flags', 'logs'], true);
+        toast(data.ok === false ? (data.message || '批量提交失败') : '批量提交完成', data.ok === false ? 'warn' : 'success');
+      } finally {
+        stopRealtimeRefresh(startedRealtime);
+      }
+    });
     await api('/api/submit/batch', { method: 'POST', body });
     state.submit.batchFlag = '';
-    watchProgress(progress_id, async data => {
-      await refreshKinds(['accounts', 'challenges', 'files', 'flags', 'logs'], true);
-      toast(data.ok === false ? (data.message || '批量提交失败') : '批量提交完成', data.ok === false ? 'warn' : 'success');
-    });
     toast('批量提交已在后台开始', 'success');
   } catch (err) {
+    stopRealtimeRefresh(startedRealtime);
     stopProgress(progress_id, true);
     toast(err.message);
-  } finally {
-    stopRealtimeRefresh(startedRealtime);
   }
 }
 
@@ -1580,7 +1616,7 @@ function configBodyFromDom() {
       skip_file_categories: document.getElementById('cfgSkipCats').value.split(',').map(x => x.trim().toUpperCase()).filter(Boolean),
       proxy: {
         enabled: document.getElementById('cfgProxyEnabled').checked,
-        list: document.getElementById('cfgProxyList').value.split(/\s+/).map(x => x.trim()).filter(Boolean),
+        list: proxyListFromDom(),
         mode: document.getElementById('cfgProxyMode').value
       }
     }
