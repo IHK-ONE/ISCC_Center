@@ -26,9 +26,9 @@ const state = {
   operationPanel: null,
   expandedUserLists: {},
   importText: '',
-  filters: { account: '', category: '', status: 'all', q: '' },
+  filters: { account: '', source: '', category: '', status: 'all', q: '' },
   flagFilters: { category: '', chal: '', q: '' },
-  fileFilters: { account: '', category: '', chal: '', q: '' },
+  fileFilters: { account: '', source: '', category: '', chal: '', q: '' },
   busy: {},
   progressJobs: {},
   progressTimers: {},
@@ -40,6 +40,31 @@ const state = {
 
 function h(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+const challengeSources = [
+  { value: 'challenge', label: '练武' },
+  { value: 'arena', label: '擂台' },
+  { value: 'measure', label: '实战' }
+];
+
+function challengeSourceValue(item) {
+  return String(item?.source || 'challenge');
+}
+
+function challengeSourceLabel(source) {
+  return challengeSources.find(item => item.value === String(source || 'challenge'))?.label || '练武';
+}
+
+function challengeDisplayId(item) {
+  const source = challengeSourceValue(item);
+  const id = String(item?.id ?? item?.challenge_id ?? '');
+  if (!id || id.includes(':')) return id;
+  return `${source}:${id}`;
+}
+
+function sourceSelectOptions(selected) {
+  return `<option value="">全部赛道</option>${challengeSources.map(item => `<option value="${h(item.value)}" ${String(selected) === item.value ? 'selected' : ''}>${h(item.label)}</option>`).join('')}`;
 }
 
 function toast(message, type='error') {
@@ -623,7 +648,7 @@ function renderAccountsPage() {
 function challengesTableHtml() {
   const filtered = filteredChallenges();
   return `<div class="table-wrap"><table><thead><tr><th>ID</th><th>题目</th><th>分类</th><th>分值</th><th>已解用户</th><th>未解用户</th><th>访问状态</th><th>附件</th><th>操作</th></tr></thead><tbody>
-    ${filtered.map(c => `<tr><td>${h(c.id)}</td><td><strong>${h(c.name || '未命名')}</strong> <button class="ghost rename-btn" onclick="renameChallenge('${h(c.id)}')">重命名</button><br><span class="muted">解出次数：${h(c.solves ?? '-')}</span></td><td><span class="pill">${h(c.category || '-')}</span></td><td>${h(c.value ?? '-')}</td><td>${renderUserChips(c.solved_by || [], 'good', `solved-${c.id}`)}</td><td>${renderUserChips(c.unsolved_by || [], 'bad', `unsolved-${c.id}`)}</td><td><span class="pill ${Number(c.visit_count || 0) >= Number(c.account_count || state.accounts.length || 0) ? 'good' : 'warn'}">${h(c.visit_count || 0)}/${h(c.account_count || state.accounts.length || 0)}</span><br>${renderUserChips(c.unvisited_by || [], 'warn', `unvisited-${c.id}`)}</td><td>${(c.files || []).length} 个</td><td><button onclick="openChallenge('${c.id}')">详情</button></td></tr>`).join('') || '<tr><td colspan="9" class="muted">暂无题目，先同步题目。</td></tr>'}
+    ${filtered.map(c => `<tr><td>${h(challengeDisplayId(c))}</td><td><strong>${h(c.name || '未命名')}</strong> <span class="pill">${h(c.source_label || challengeSourceLabel(challengeSourceValue(c)))}</span> <button class="ghost rename-btn" onclick="renameChallenge('${h(c.id)}')">重命名</button><br><span class="muted">解出次数：${h(c.solves ?? '-')}</span></td><td><span class="pill">${h(c.category || '-')}</span></td><td>${h(c.value ?? '-')}</td><td>${renderUserChips(c.solved_by || [], 'good', `solved-${c.id}`)}</td><td>${renderUserChips(c.unsolved_by || [], 'bad', `unsolved-${c.id}`)}</td><td><span class="pill ${Number(c.visit_count || 0) >= Number(c.account_count || state.accounts.length || 0) ? 'good' : 'warn'}">${h(c.visit_count || 0)}/${h(c.account_count || state.accounts.length || 0)}</span><br>${renderUserChips(c.unvisited_by || [], 'warn', `unvisited-${c.id}`)}</td><td>${(c.files || []).length} 个</td><td><button onclick="openChallenge('${c.id}')">详情</button></td></tr>`).join('') || '<tr><td colspan="9" class="muted">暂无题目，先同步题目。</td></tr>'}
   </tbody></table></div>`;
 }
 
@@ -638,6 +663,7 @@ function renderChallengesPage() {
     <div class="card">
       <div class="filters">
         <div><label>账号视图</label>${accountSelectWithValue('filterAccount', true, state.filters.account, 'updateFilterFromDom()')}</div>
+        <div><label>赛道</label><select id="filterSource" onchange="updateFilterFromDom()">${sourceSelectOptions(state.filters.source)}</select></div>
         <div><label>分类</label><select id="filterCategory" onchange="updateFilterFromDom()"><option value="">全部分类</option>${cats.map(c => `<option ${state.filters.category === c ? 'selected' : ''} value="${h(c)}">${h(c)}</option>`).join('')}</select></div>
         <div><label>状态</label><select id="filterStatus" onchange="updateFilterFromDom()"><option value="all" ${state.filters.status === 'all' ? 'selected' : ''}>全部</option><option value="solved" ${state.filters.status === 'solved' ? 'selected' : ''}>已解</option><option value="unsolved" ${state.filters.status === 'unsolved' ? 'selected' : ''}>未解</option></select></div>
         <div><label>搜索</label><input id="filterQ" value="${h(state.filters.q)}" oninput="state.filters.q=this.value; renderChallengesTable()" placeholder="题目名 / ID / 分类"></div>
@@ -652,6 +678,7 @@ function accountSelectWithValue(id, allowAll, value, onchange) {
 
 function updateFilterFromDom(render=true) {
   state.filters.account = document.getElementById('filterAccount')?.value || '';
+  state.filters.source = document.getElementById('filterSource')?.value || '';
   state.filters.category = document.getElementById('filterCategory')?.value || '';
   state.filters.status = document.getElementById('filterStatus')?.value || 'all';
   state.filters.q = document.getElementById('filterQ')?.value || '';
@@ -741,12 +768,13 @@ function captureSubmitInputs() {
 function filteredChallenges() {
   const q = state.filters.q.trim().toLowerCase();
   return state.challenges.filter(c => {
+    if (state.filters.source && challengeSourceValue(c) !== state.filters.source) return false;
     if (state.filters.category && c.category !== state.filters.category) return false;
     const solved = challengeSolved(c);
     if (state.filters.status === 'solved' && !solved) return false;
     if (state.filters.status === 'unsolved' && solved) return false;
     if (q) {
-      const hay = `${c.id} ${c.name || ''} ${c.category || ''}`.toLowerCase();
+      const hay = `${c.id} ${challengeDisplayId(c)} ${c.name || ''} ${c.category || ''} ${c.source_label || challengeSourceLabel(challengeSourceValue(c))}`.toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
@@ -797,9 +825,9 @@ function updateFlagFilterFromDom(render=true) {
 
 function renderSubmitPage() {
   const batchChal = selectedChallengeId('batchChal');
-  const challengeOptions = selected => state.challenges.map(c => `<option value="${h(c.id)}" ${String(selected) === String(c.id) ? 'selected' : ''}>${h(c.name || ('题目 ' + c.id))}（#${h(c.id)} / ${h(c.category || '-')}）</option>`).join('');
+  const challengeOptions = selected => state.challenges.map(c => `<option value="${h(c.id)}" ${String(selected) === String(c.id) ? 'selected' : ''}>${h(c.name || ('题目 ' + challengeDisplayId(c)))}（#${h(challengeDisplayId(c))} / ${h(c.category || '-')}）</option>`).join('');
   const flagCategories = [...new Set(state.challenges.map(c => c.category).filter(Boolean))].sort();
-  const flagChallengeOptions = state.challenges.filter(c => !state.flagFilters.category || c.category === state.flagFilters.category).map(c => `<option value="${h(c.id)}" ${String(state.flagFilters.chal) === String(c.id) ? 'selected' : ''}>${h(c.name || ('题目 ' + c.id))}（#${h(c.id)} / ${h(c.category || '-')}）</option>`).join('');
+  const flagChallengeOptions = state.challenges.filter(c => !state.flagFilters.category || c.category === state.flagFilters.category).map(c => `<option value="${h(c.id)}" ${String(state.flagFilters.chal) === String(c.id) ? 'selected' : ''}>${h(c.name || ('题目 ' + challengeDisplayId(c)))}（#${h(challengeDisplayId(c))} / ${h(c.category || '-')}）</option>`).join('');
   return `
     ${pageTitle('提交', '选择一个题目向多个账号批量提交，并管理已保存 Flag。')}
     <div class="card submit-batch-card">
@@ -823,13 +851,15 @@ function renderSubmitPage() {
 }
 
 function filesFilterHtml() {
-  const fileCategories = [...new Set(state.challenges.filter(challengeHasAttachmentInfo).map(c => c.category).filter(Boolean))].sort();
-  const challengeOptions = state.challenges.filter(challengeHasAttachmentInfo).filter(c => !state.fileFilters.category || c.category === state.fileFilters.category).map(c => `<option value="${h(c.id)}" ${String(state.fileFilters.chal) === String(c.id) ? 'selected' : ''}>${h(fileChallengeName(c.name, c.id))}</option>`).join('');
+  const fileChallenges = state.challenges.filter(challengeHasAttachmentInfo).filter(c => !state.fileFilters.source || challengeSourceValue(c) === state.fileFilters.source);
+  const fileCategories = [...new Set(fileChallenges.map(c => c.category).filter(Boolean))].sort();
+  const challengeOptions = fileChallenges.filter(c => !state.fileFilters.category || c.category === state.fileFilters.category).map(c => `<option value="${h(c.id)}" ${String(state.fileFilters.chal) === String(c.id) ? 'selected' : ''}>${h(fileChallengeName(c.name, challengeDisplayId(c)))}（#${h(challengeDisplayId(c))} / ${h(c.source_label || challengeSourceLabel(challengeSourceValue(c)))})</option>`).join('');
   return `<div class="filters files-filters">
     <div><label>用户</label>${accountSelectWithValue('fileFilterAccount', true, state.fileFilters.account, 'updateFileFilterFromDom()')}</div>
+    <div><label>赛道</label><select id="fileFilterSource" onchange="updateFileFilterFromDom()">${sourceSelectOptions(state.fileFilters.source)}</select></div>
     <div><label>分类</label><select id="fileFilterCategory" onchange="updateFileFilterFromDom()"><option value="">全部分类</option>${fileCategories.map(c => `<option value="${h(c)}" ${state.fileFilters.category === c ? 'selected' : ''}>${h(c)}</option>`).join('')}</select></div>
     <div><label>题目名称</label><select id="fileFilterChal" onchange="updateFileFilterFromDom()"><option value="">全部题目</option>${challengeOptions}</select></div>
-    <div><label>搜索</label><input id="fileFilterQ" value="${h(state.fileFilters.q)}" oninput="state.fileFilters.q=this.value; renderFilesTable()" placeholder="题目 / 文件名 / MD5 / 账号"></div>
+    <div><label>搜索</label><input id="fileFilterQ" value="${h(state.fileFilters.q)}" oninput="state.fileFilters.q=this.value; renderFilesTable()" placeholder="题目 / 赛道 / 文件名 / MD5 / 账号"></div>
   </div>`;
 }
 
@@ -837,7 +867,7 @@ function filesTableHtml() {
   const files = filteredFiles();
   return `<div class="toolbar"><span class="muted">共 ${files.length}/${state.files.length} 个附件记录。原始下载只会打开当前筛选结果里的 ISCC 原始链接。</span></div>
   <div class="table-wrap"><table><thead><tr><th>账号</th><th>题目</th><th>原文件</th><th>保存文件</th><th>大小</th><th>MD5</th><th>更新时间</th><th>操作</th></tr></thead><tbody>
-    ${files.map(f => `<tr><td>${h(f.account_username || f.account_id)}</td><td><strong>${h(fileDisplayChallengeName(f))}</strong></td><td>${h(f.original_name)}</td><td class="kbd">${h(f.stored_name)}</td><td>${formatSize(f.size)}</td><td><span class="kbd">${h(f.md5 || '-')}</span></td><td>${h(f.updated_at || '-')}</td><td><div class="row-actions">${f.source_url ? `<a class="pill" href="${h(f.source_url)}" target="_blank" rel="noopener noreferrer">下载原始</a>` : '<span class="pill">无链接</span>'}<button class="danger" onclick="deleteFileRecord('${h(f.file_id)}')">删除</button></div></td></tr>`).join('') || '<tr><td colspan="8" class="muted">暂无附件记录。</td></tr>'}
+    ${files.map(f => `<tr><td>${h(f.account_username || f.account_id)}</td><td><strong>${h(fileDisplayChallengeName(f))}</strong> <span class="pill">${h(f.source_label || challengeSourceLabel(f.source))}</span><br><span class="muted">#${h(challengeDisplayId(f) || '-')}</span></td><td>${h(f.original_name)}</td><td class="kbd">${h(f.stored_name)}</td><td>${formatSize(f.size)}</td><td><span class="kbd">${h(f.md5 || '-')}</span></td><td>${h(f.updated_at || '-')}</td><td><div class="row-actions">${f.source_url ? `<a class="pill" href="${h(f.source_url)}" target="_blank" rel="noopener noreferrer">下载原始</a>` : '<span class="pill">无链接</span>'}<button class="danger" onclick="deleteFileRecord('${h(f.file_id)}')">删除</button></div></td></tr>`).join('') || '<tr><td colspan="8" class="muted">暂无附件记录。</td></tr>'}
   </tbody></table></div>`;
 }
 
@@ -874,11 +904,13 @@ function filteredFiles() {
   const q = state.fileFilters.q.trim().toLowerCase();
   return state.files.filter(f => {
     const challenge = state.challenges.find(item => String(item.id) === String(f.challenge_id));
+    const source = challenge ? challengeSourceValue(challenge) : String(f.source || 'challenge');
     if (state.fileFilters.account && f.account_id !== state.fileFilters.account) return false;
+    if (state.fileFilters.source && source !== state.fileFilters.source) return false;
     if (state.fileFilters.category && challenge?.category !== state.fileFilters.category) return false;
     if (state.fileFilters.chal && String(f.challenge_id) !== String(state.fileFilters.chal)) return false;
     if (q) {
-      const hay = `${f.account_username || ''} ${f.account_id || ''} ${f.challenge_id || ''} ${fileDisplayChallengeName(f)} ${f.challenge_name || ''} ${challenge?.name || ''} ${challenge?.category || ''} ${f.original_name || ''} ${f.stored_name || ''} ${f.md5 || ''}`.toLowerCase();
+      const hay = `${f.account_username || ''} ${f.account_id || ''} ${challengeDisplayId(f)} ${fileDisplayChallengeName(f)} ${f.challenge_name || ''} ${challenge?.name || ''} ${challenge?.category || ''} ${f.source_label || challengeSourceLabel(source)} ${f.original_name || ''} ${f.stored_name || ''} ${f.md5 || ''}`.toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
@@ -986,13 +1018,16 @@ async function refreshLogs(showError=true) {
 
 function updateFileFilterFromDom(render=true) {
   state.fileFilters.account = document.getElementById('fileFilterAccount')?.value || '';
+  const previousSource = state.fileFilters.source;
   const previousCategory = state.fileFilters.category;
+  state.fileFilters.source = document.getElementById('fileFilterSource')?.value || '';
   state.fileFilters.category = document.getElementById('fileFilterCategory')?.value || '';
   state.fileFilters.chal = document.getElementById('fileFilterChal')?.value || '';
   state.fileFilters.q = document.getElementById('fileFilterQ')?.value || state.fileFilters.q || '';
-  if (previousCategory !== state.fileFilters.category) state.fileFilters.chal = '';
+  if (previousSource !== state.fileFilters.source) state.fileFilters.category = '';
+  if (previousSource !== state.fileFilters.source || previousCategory !== state.fileFilters.category) state.fileFilters.chal = '';
   if (!render) return;
-  if (previousCategory !== state.fileFilters.category) renderMainOrApp();
+  if (previousSource !== state.fileFilters.source || previousCategory !== state.fileFilters.category) renderMainOrApp();
   else renderFilesTable() || renderMainOrApp();
 }
 
@@ -1003,17 +1038,17 @@ function fileChallengeName(name, chalId) {
 
 function challengeTitle(chalId) {
   const c = state.challenges.find(item => String(item.id) === String(chalId));
-  return c ? fileChallengeName(c.name, c.id) : chalId;
+  return c ? fileChallengeName(c.name, challengeDisplayId(c)) : chalId;
 }
 
 function challengeName(chalId) {
   const c = state.challenges.find(item => String(item.id) === String(chalId));
-  return c ? `${challengeTitle(chalId)}（#${c.id}）` : chalId;
+  return c ? `${challengeTitle(chalId)}（#${challengeDisplayId(c)}）` : chalId;
 }
 
 function fileDisplayChallengeName(file) {
   const c = state.challenges.find(item => String(item.id) === String(file.challenge_id));
-  return c ? fileChallengeName(c.name, c.id) : fileChallengeName(file.challenge_name, file.challenge_id);
+  return c ? fileChallengeName(c.name, challengeDisplayId(c)) : fileChallengeName(file.challenge_name, challengeDisplayId(file));
 }
 
 function setChecked(selector, checked, skipDisabled=false) {
@@ -1165,7 +1200,7 @@ function renderChallengeModal() {
   if (!c) return '';
   const files = state.files.filter(f => String(f.challenge_id) === String(c.id));
   return `<div class="modal-backdrop" onclick="closeModal(event)"><div class="modal" onclick="event.stopPropagation()">
-    <div class="page-title"><div><h2>#${h(c.id)} ${h(c.name || '')}</h2><p>${h(c.category || '')} · ${h(c.value ?? '-')} 分 · 解出次数 ${h(c.solves ?? '-')}</p></div><div class="toolbar"><button class="ghost" onclick="renameChallenge('${h(c.id)}')">重命名</button><button class="ghost" onclick="state.modalChallenge=null;renderModalRoots()">关闭</button></div></div>
+    <div class="page-title"><div><h2>#${h(challengeDisplayId(c))} ${h(c.name || '')}</h2><p>${h(c.source_label || challengeSourceLabel(challengeSourceValue(c)))} · ${h(c.category || '')} · ${h(c.value ?? '-')} 分 · 解出次数 ${h(c.solves ?? '-')}</p></div><div class="toolbar"><button class="ghost" onclick="renameChallenge('${h(c.id)}')">重命名</button><button class="ghost" onclick="state.modalChallenge=null;renderModalRoots()">关闭</button></div></div>
     <h3>题目描述</h3><div class="pre">${h(c.description || '暂无描述')}</div>
     <h3>已解账号</h3>${renderUserChips(c.solved_by || [], 'good')}
     <h3>未解账号</h3>${renderUserChips(c.unsolved_by || [], 'bad')}
@@ -1386,11 +1421,12 @@ function challengeHasAttachmentInfo(challenge) {
 
 function filteredChallengesForFileView() {
   return state.challenges.filter(challengeHasAttachmentInfo).filter(challenge => {
+    if (state.fileFilters.source && challengeSourceValue(challenge) !== state.fileFilters.source) return false;
     if (state.fileFilters.category && challenge.category !== state.fileFilters.category) return false;
     if (state.fileFilters.chal && String(challenge.id) !== String(state.fileFilters.chal)) return false;
     const q = state.fileFilters.q.trim().toLowerCase();
     if (q) {
-      const hay = `${challenge.id} ${challenge.name || ''} ${challenge.category || ''}`.toLowerCase();
+      const hay = `${challenge.id} ${challengeDisplayId(challenge)} ${challenge.name || ''} ${challenge.category || ''} ${challenge.source_label || challengeSourceLabel(challengeSourceValue(challenge))}`.toLowerCase();
       const hasFileMatch = state.files.some(file => String(file.challenge_id) === String(challenge.id) && `${file.account_username || ''} ${file.account_id || ''} ${file.original_name || ''} ${file.stored_name || ''} ${file.md5 || ''}`.toLowerCase().includes(q));
       if (!hay.includes(q) && !hasFileMatch) return false;
     }

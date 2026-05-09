@@ -60,7 +60,7 @@ CHALLENGE_SOURCE_PATHS = {
         "detail": "/measure/{id}",
         "submit": "/measure/submit",
         "solves": "/solves_measure",
-        "referer": "/measure",
+        "referer": "/challenges",
     },
 }
 
@@ -690,6 +690,29 @@ def cached_challenge_source(chal_id, fallback=None):
     return challenge_source(challenge)
 
 
+def challenge_source_label(source):
+    return {
+        CHALLENGE_SOURCE_DEFAULT: "练武",
+        CHALLENGE_SOURCE_ARENA: "擂台",
+        CHALLENGE_SOURCE_MEASURE: "实战",
+    }.get(normalize_challenge_source(source), "练武")
+
+
+def challenge_display_category(challenge):
+    if challenge_source(challenge) == CHALLENGE_SOURCE_MEASURE:
+        return "实战"
+    if isinstance(challenge, dict):
+        return challenge.get("category") or "未分类"
+    return "未分类"
+
+
+def challenge_sort_key(chal_id):
+    source, remote_id = split_challenge_ref(chal_id)
+    source_order = {source_name: index for index, source_name in enumerate(CHALLENGE_SOURCES)}.get(source, len(CHALLENGE_SOURCES))
+    remote_text = str(remote_id or "")
+    return (source_order, int(remote_text) if remote_text.isdigit() else 0, remote_text)
+
+
 def looks_like_login_page(html):
     text = (html or "").lower()
     return "用户登录" in (html or "") or "/login" in text or "name=\"password\"" in text or "name='password'" in text
@@ -1192,7 +1215,7 @@ class ISCCClient:
                 if isinstance(data, dict):
                     status = str(data.get("status") or "").strip().lower()
                     message = str(data.get("message") or data.get("msg") or raw[:80])
-                    ok = bool(data.get("ok")) or status in {"success", "ok"} or str(data.get("code")) == "1"
+                    ok = bool(data.get("ok")) or bool(data.get("success")) or status in {"success", "ok", "correct"} or str(data.get("code")) == "1"
                     return {
                         "ok": ok,
                         "raw": raw[:200],
@@ -1200,6 +1223,8 @@ class ISCCClient:
                         "payload_mode": payload_mode,
                         "no_retry": not ok,
                     }
+            if "已经解答过" in raw:
+                return {"ok": False, "raw": raw[:200], "message": "提交失败：该账号已经解答过这道题", "payload_mode": payload_mode, "no_retry": True}
             if raw == "0":
                 return {
                     "ok": False,
@@ -1337,7 +1362,9 @@ class ISCCClient:
 
     def download_challenge_files(self, account_id, challenge_info):
         with self.lock:
-            category = normalize_category(challenge_info.get("category"))
+            source = challenge_source(challenge_info)
+            display_category = challenge_display_category(challenge_info)
+            category = normalize_category(display_category)
             skip_categories = {normalize_category(item) for item in self.iscc_cfg.get("skip_file_categories", [])}
             if category in skip_categories:
                 return []
@@ -1346,7 +1373,6 @@ class ISCCClient:
             if not files:
                 return []
 
-            source = challenge_source(challenge_info)
             chal_id = challenge_cache_key(source, challenge_info.get("id"))
             chal_name = challenge_info.get("name") or f"challenge-{chal_id}"
             results = []
@@ -1372,7 +1398,7 @@ class ISCCClient:
                             "account_username": self.username,
                             "challenge_id": chal_id,
                             "challenge_name": chal_name,
-                            "category": challenge_info.get("category"),
+                            "category": display_category,
                             "source": source,
                             "source_url": source_url,
                             "original_name": original_name,
@@ -1418,7 +1444,7 @@ class ISCCClient:
                             "account_username": self.username,
                             "challenge_id": chal_id,
                             "challenge_name": chal_name,
-                            "category": challenge_info.get("category"),
+                            "category": display_category,
                             "source": source,
                             "source_url": source_url,
                             "original_name": original_name,
@@ -1566,8 +1592,9 @@ def flatten_files(files_data, account_id=None, chal_id=None):
                 row.setdefault("account_username", account_names.get(aid, item.get("account_username", aid)))
                 row.setdefault("challenge_id", cid)
                 row.setdefault("challenge_name", challenge_display_name(chal) or item.get("challenge_name") or cid)
-                row.setdefault("category", chal.get("category") or item.get("category"))
+                row.setdefault("category", challenge_display_category(chal) if chal else item.get("category"))
                 row.setdefault("source", chal.get("source") or item.get("source") or CHALLENGE_SOURCE_DEFAULT)
+                row.setdefault("source_label", challenge_source_label(row.get("source")))
                 rows.append(row)
     rows.sort(key=lambda item: (item.get("account_username", ""), str(item.get("challenge_id", "")), item.get("original_name", "")))
     return rows
@@ -1649,8 +1676,9 @@ def flatten_flags(flags_data, account_id=None, chal_id=None):
         row.pop("account_username", None)
         row.setdefault("flag_md5", flag_md5(row.get("flag")))
         row.setdefault("challenge_name", challenge_display_name(chal) or item.get("challenge_name") or cid)
-        row.setdefault("category", chal.get("category") or item.get("category"))
+        row.setdefault("category", challenge_display_category(chal) if chal else item.get("category"))
         row.setdefault("source", chal.get("source") or item.get("source") or CHALLENGE_SOURCE_DEFAULT)
+        row.setdefault("source_label", challenge_source_label(row.get("source")))
         if not row.get("attachment_md5"):
             row["attachment_md5"] = md5_by_key.get((row.get("account_id"), str(row.get("chal_id"))), "")
         key = row.get("dedupe_key") or flag_record_key(row.get("chal_id") or 0, row.get("flag_md5"), row.get("attachment_md5"))
@@ -1690,6 +1718,8 @@ def save_challenge_detail(chal_id, detail, fallback=None):
     merged["id"] = cache_key
     merged["remote_id"] = int(remote_id) if str(remote_id).isdigit() else remote_id
     merged["source"] = source
+    if source == CHALLENGE_SOURCE_MEASURE:
+        merged["category"] = "实战"
     if custom_name:
         merged["custom_name"] = custom_name
         merged["name"] = custom_name
@@ -1757,8 +1787,10 @@ def previsit_cached_challenge_details(client, account_id=None, challenge_ids=Non
     ids = [str(item) for item in (challenge_ids or items.keys()) if str(item).strip()]
     for index, chal_id in enumerate(ids, start=1):
         check_progress_control(progress_id)
+        challenge = items.get(str(chal_id), {})
+        source = cached_challenge_source(chal_id, fallback=challenge)
         if progress_id:
-            update_progress(progress_id, username=username, message=f"正在预访问题目详情：{index}/{len(ids)}")
+            update_progress(progress_id, index, len(ids), username=username, message=f"正在预访问题目详情：{index}/{len(ids)} [{challenge_source_label(source)}] {chal_id}")
         if consume_progress_skip(progress_id):
             add_progress_event(progress_id, username or client.username, True, f"已跳过题目详情预访问：{chal_id}", kind="skip", chal_id=chal_id)
             continue
@@ -2330,12 +2362,13 @@ def api_sync_challenges():
         errors = []
         for index, chal in enumerate(listed, start=1):
             check_progress_control(progress_id)
-            update_progress(progress_id, index, total, account.get("username"), f"正在同步题目详情：{index}/{total}")
             chal_id = chal.get("id")
             if chal_id is None:
                 continue
             source = challenge_source(chal)
             cache_key = challenge_cache_key(source, chal_id)
+            name = chal.get("name") or f"#{cache_key}"
+            update_progress(progress_id, index, total, account.get("username"), f"正在同步题目详情：{index}/{total} [{challenge_source_label(source)}] {name}")
             seen_ids.add(cache_key)
             try:
                 detail = client.get_challenge_detail(chal_id, source=source)
@@ -2345,6 +2378,8 @@ def api_sync_challenges():
                 merged["id"] = cache_key
                 merged["remote_id"] = int(chal_id) if str(chal_id).isdigit() else chal_id
                 merged["source"] = source
+                if source == CHALLENGE_SOURCE_MEASURE:
+                    merged["category"] = "实战"
                 merged.setdefault("files", [])
                 items[cache_key] = merged
                 save_challenges({"updated_at": utc_now(), "items": items})
@@ -2354,6 +2389,8 @@ def api_sync_challenges():
                 partial["id"] = cache_key
                 partial["remote_id"] = int(chal_id) if str(chal_id).isdigit() else chal_id
                 partial["source"] = source
+                if source == CHALLENGE_SOURCE_MEASURE:
+                    partial["category"] = "实战"
                 partial.setdefault("name", f"#{cache_key}")
                 partial.setdefault("files", [])
                 items[cache_key] = partial
@@ -2453,7 +2490,7 @@ def sync_run_operation(progress_id, body):
             source = challenge_source(chal)
             cache_key = challenge_cache_key(source, chal_id)
             name = chal.get("name") or f"#{cache_key}"
-            update_progress(progress_id, 0, total, first.get("username"), f"正在同步题目详情：{detail_index}/{len(listed)} {name}")
+            update_progress(progress_id, detail_index, len(listed), first.get("username"), f"正在同步题目详情：{detail_index}/{len(listed)} [{challenge_source_label(source)}] {name}")
             seen_ids.add(cache_key)
             try:
                 detail = client.get_challenge_detail(chal_id, source=source)
@@ -2476,6 +2513,8 @@ def sync_run_operation(progress_id, body):
                 partial["id"] = cache_key
                 partial["remote_id"] = int(chal_id) if str(chal_id).isdigit() else chal_id
                 partial["source"] = source
+                if source == CHALLENGE_SOURCE_MEASURE:
+                    partial["category"] = "实战"
                 partial.setdefault("name", name)
                 partial.setdefault("files", [])
                 items[cache_key] = partial
@@ -2491,7 +2530,7 @@ def sync_run_operation(progress_id, body):
         errors.append({"account_id": first.get("id"), "error": str(exc)})
         add_progress_event(progress_id, first.get("username"), False, f"题目同步失败：{exc}")
 
-    synced_challenge_ids = sorted(seen_ids, key=lambda item: int(item) if str(item).isdigit() else str(item))
+    synced_challenge_ids = sorted(seen_ids, key=challenge_sort_key)
     solves_data = load_solves()
     results = []
     for index, account in enumerate(accounts, start=1):
@@ -2547,20 +2586,23 @@ def api_challenges():
     solved_by_chal = challenge_solve_map(solves_data)
     items = []
     for chal_id, challenge in challenges_data.get("items", {}).items():
+        display_category = challenge_display_category(challenge)
         solved_ids = sorted(solved_by_chal.get(str(chal_id), set()))
         solved = account_id in solved_ids if account_id else bool(solved_ids)
-        if category and challenge.get("category") != category:
+        if category and display_category != category:
             continue
         if status_filter == "solved" and not solved:
             continue
         if status_filter == "unsolved" and solved:
             continue
         if q:
-            haystack = f"{chal_id} {challenge.get('name', '')} {challenge.get('category', '')}".lower()
+            haystack = f"{chal_id} {challenge.get('name', '')} {display_category} {challenge_source_label(challenge_source(challenge))}".lower()
             if q not in haystack:
                 continue
         item = apply_challenge_custom_name(challenge)
+        item["category"] = display_category
         item["id"] = str(challenge.get("id") or chal_id)
+        item["source_label"] = challenge_source_label(challenge_source(challenge))
         item["solved"] = solved
         item["solved_by_ids"] = solved_ids
         item["solved_by"] = [{"account_id": aid, "username": account_names.get(aid, aid)} for aid in solved_ids]
@@ -2996,7 +3038,7 @@ def files_update_operation(progress_id, body):
                         mark_challenge_detail_visited(account.get("id"), client, chal_id)
                     detail.setdefault("id", str(chal_id))
                     detail.setdefault("name", challenge.get("name") or f"#{chal_id}")
-                    detail.setdefault("category", challenge.get("category"))
+                    detail.setdefault("category", challenge_display_category(challenge))
                     if not detail.get("files"):
                         skipped_count += 1
                         account_files.pop(str(chal_id), None)
