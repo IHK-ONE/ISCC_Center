@@ -2269,6 +2269,7 @@ def sync_run_operation(progress_id, body):
     challenges_updated = 0
     cache_total = 0
     errors = []
+    seen_ids = set()
     try:
         update_progress(progress_id, 0, total, first.get("username"), f"正在同步题目：{first.get('username')}")
         client = get_ready_client(first, accounts_data, cfg)
@@ -2276,7 +2277,6 @@ def sync_run_operation(progress_id, body):
         listed = [chal for chal in listed if not requested_ids or str(chal.get("id")) in requested_ids]
         challenges_data = load_challenges()
         items = dict(challenges_data.get("items", {}))
-        seen_ids = set()
         for detail_index, chal in enumerate(listed, start=1):
             check_progress_control(progress_id)
             chal_id = chal.get("id")
