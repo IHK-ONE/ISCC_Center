@@ -36,6 +36,24 @@ ISCC_BASE_URL = "https://iscc.isclab.org.cn"
 ISCC_RETRY_ATTEMPTS = 3
 OPERATION_DELAY_DEFAULT_SECONDS = 0
 OPERATION_DELAY_MAX_SECONDS = 60
+CHALLENGE_SOURCE_DEFAULT = "challenge"
+CHALLENGE_SOURCE_ARENA = "arena"
+CHALLENGE_SOURCE_PATHS = {
+    CHALLENGE_SOURCE_DEFAULT: {
+        "list": "/chals",
+        "detail": "/chals/{id}",
+        "submit": "/chal/{id}",
+        "solves": "/solves",
+        "referer": "/challenges",
+    },
+    CHALLENGE_SOURCE_ARENA: {
+        "list": "/arenas",
+        "detail": "/arenas/{id}",
+        "submit": "/are/{id}",
+        "solves": "/arenasolves",
+        "referer": "/arenas",
+    },
+}
 
 
 class ISCCError(Exception):
@@ -611,6 +629,28 @@ def normalize_category(value):
     return str(value or "").strip().upper()
 
 
+def normalize_challenge_source(value):
+    value = str(value or CHALLENGE_SOURCE_DEFAULT).strip().lower()
+    if value in {"arena", "arenas", "擂台"}:
+        return CHALLENGE_SOURCE_ARENA
+    return CHALLENGE_SOURCE_DEFAULT
+
+
+def challenge_endpoint(source, key):
+    return CHALLENGE_SOURCE_PATHS[normalize_challenge_source(source)][key]
+
+
+def challenge_source(challenge):
+    return normalize_challenge_source((challenge or {}).get("source"))
+
+
+def cached_challenge_source(chal_id, fallback=None):
+    if fallback and fallback.get("source"):
+        return challenge_source(fallback)
+    challenge = load_challenges().get("items", {}).get(str(chal_id), {})
+    return challenge_source(challenge)
+
+
 def looks_like_login_page(html):
     text = (html or "").lower()
     return "用户登录" in (html or "") or "/login" in text or "name=\"password\"" in text or "name='password'" in text
@@ -1067,7 +1107,9 @@ class ISCCClient:
         if clear_session:
             self.session.cookies.clear()
 
-    def submit_flag_once(self, chal_id, flag):
+    def submit_flag_once(self, chal_id, flag, source=CHALLENGE_SOURCE_DEFAULT):
+        source = normalize_challenge_source(source)
+
         def payload_modes():
             preferred = self.iscc_cfg.get("submit_payload_mode") or "data"
             modes = []
@@ -1081,15 +1123,16 @@ class ISCCClient:
         raw = ""
         headers = {
             "Accept": "text/plain,application/json,*/*",
-            "Referer": self.url("/challenges"),
+            "Referer": self.url(challenge_endpoint(source, "referer")),
             "X-Requested-With": "XMLHttpRequest",
         }
+        submit_path = challenge_endpoint(source, "submit").format(id=chal_id)
         for payload_mode in payload_modes():
             if not self.nonce:
                 self.nonce = self.get_nonce()
             payload = {"key": flag, "nonce": self.nonce}
             try:
-                response = self.request("POST", f"/chal/{chal_id}", headers=headers, **{payload_mode: payload})
+                response = self.request("POST", submit_path, headers=headers, **{payload_mode: payload})
                 raw = response.text.strip()
             except ISCCError as exc:
                 if exc.auth_error:
@@ -1118,7 +1161,8 @@ class ISCCClient:
             return last_failure
         raise ISCCError(last_error or "未知提交结果")
 
-    def submit_flag(self, chal_id, flag):
+    def submit_flag(self, chal_id, flag, source=CHALLENGE_SOURCE_DEFAULT):
+        source = normalize_challenge_source(source)
         with self.lock:
             last_result = None
             last_error = None
@@ -1126,7 +1170,7 @@ class ISCCClient:
                 try:
                     if not self.logged_in or not self.nonce:
                         self.login(force=True)
-                    result = self.submit_flag_once(chal_id, flag)
+                    result = self.submit_flag_once(chal_id, flag, source=source)
                     if result.get("ok") or result.get("no_retry") or str(result.get("raw")) in {"0", "2", "3", "4"}:
                         result["attempts"] = attempt
                         return result
@@ -1138,7 +1182,7 @@ class ISCCClient:
                         self.reset_login_state(clear_session=exc.auth_error)
                     if is_submit_gateway_error(exc):
                         try:
-                            self.get_challenge_detail_once(chal_id)
+                            self.get_challenge_detail_once(chal_id, source=source)
                         except ISCCError as detail_exc:
                             log_event("warn", "submit_gateway_chal_detail_refresh_failed", username=self.username, proxy=self.proxy_label, chal_id=chal_id, error=str(detail_exc))
                     log_event("warn" if attempt < ISCC_RETRY_ATTEMPTS else "error", "iscc_submit_retry_failed", username=self.username, proxy=self.proxy_label, chal_id=chal_id, attempt=attempt, auth_error=exc.auth_error, transient=exc.transient, error=str(exc))
@@ -1167,40 +1211,68 @@ class ISCCClient:
                     time.sleep(0.35 * attempt)
         raise last_error
 
-    def list_challenges_once(self):
-        response = self.request("GET", "/chals", headers={"Accept": "application/json,*/*"})
+    def list_challenges_once(self, source=CHALLENGE_SOURCE_DEFAULT):
+        source = normalize_challenge_source(source)
+        response = self.request("GET", challenge_endpoint(source, "list"), headers={"Accept": "application/json,*/*"})
         data = self.parse_json(response, "题目列表")
         if not isinstance(data, dict):
             raise ISCCError("题目列表格式异常")
         if "game" not in data:
             raise ISCCError(f"题目列表缺少 game 字段，返回字段：{', '.join(data.keys())}")
-        return data.get("game", [])
+        items = data.get("game", [])
+        for item in items:
+            if isinstance(item, dict):
+                item.setdefault("source", source)
+        return items
 
-    def list_challenges(self):
+    def list_challenges(self, source=CHALLENGE_SOURCE_DEFAULT):
+        source = normalize_challenge_source(source)
         with self.lock:
-            return self.retry_with_login(self.list_challenges_once, "list_challenges")
+            return self.retry_with_login(lambda: self.list_challenges_once(source), f"list_challenges:{source}")
 
-    def get_challenge_detail_once(self, chal_id):
-        response = self.request("GET", f"/chals/{chal_id}", headers={"Accept": "application/json,*/*"})
+    def list_all_challenges(self):
+        items = []
+        for source in (CHALLENGE_SOURCE_DEFAULT, CHALLENGE_SOURCE_ARENA):
+            items.extend(self.list_challenges(source))
+        return items
+
+    def get_challenge_detail_once(self, chal_id, source=CHALLENGE_SOURCE_DEFAULT):
+        source = normalize_challenge_source(source)
+        detail_path = challenge_endpoint(source, "detail").format(id=chal_id)
+        response = self.request("GET", detail_path, headers={"Accept": "application/json,*/*"})
         data = self.parse_json(response, "题目详情")
         if not isinstance(data, dict):
             raise ISCCError(f"题目 {chal_id} 详情格式异常")
+        data.setdefault("source", source)
         return data
 
-    def get_challenge_detail(self, chal_id):
+    def get_challenge_detail(self, chal_id, source=CHALLENGE_SOURCE_DEFAULT):
+        source = normalize_challenge_source(source)
         with self.lock:
-            return self.retry_with_login(lambda: self.get_challenge_detail_once(chal_id), f"get_challenge_detail:{chal_id}")
+            return self.retry_with_login(lambda: self.get_challenge_detail_once(chal_id, source), f"get_challenge_detail:{source}:{chal_id}")
 
-    def list_solves_once(self):
-        response = self.request("GET", "/solves", headers={"Accept": "application/json,*/*"})
+    def list_solves_once(self, source=CHALLENGE_SOURCE_DEFAULT):
+        source = normalize_challenge_source(source)
+        response = self.request("GET", challenge_endpoint(source, "solves"), headers={"Accept": "application/json,*/*"})
         data = self.parse_json(response, "solves")
         if not isinstance(data, dict):
             raise ISCCError("solves 格式异常")
-        return data.get("solves", [])
+        items = data.get("solves", [])
+        for item in items:
+            if isinstance(item, dict):
+                item.setdefault("source", source)
+        return items
 
-    def list_solves(self):
+    def list_solves(self, source=CHALLENGE_SOURCE_DEFAULT):
+        source = normalize_challenge_source(source)
         with self.lock:
-            return self.retry_with_login(self.list_solves_once, "list_solves")
+            return self.retry_with_login(lambda: self.list_solves_once(source), f"list_solves:{source}")
+
+    def list_all_solves(self):
+        items = []
+        for source in (CHALLENGE_SOURCE_DEFAULT, CHALLENGE_SOURCE_ARENA):
+            items.extend(self.list_solves(source))
+        return items
 
     def download_challenge_files(self, account_id, challenge_info):
         with self.lock:
@@ -1239,6 +1311,7 @@ class ISCCClient:
                             "challenge_id": int(challenge_info.get("id")),
                             "challenge_name": chal_name,
                             "category": challenge_info.get("category"),
+                            "source": challenge_source(challenge_info),
                             "source_url": source_url,
                             "original_name": original_name,
                             "stored_name": stored_name,
@@ -1284,6 +1357,7 @@ class ISCCClient:
                             "challenge_id": int(challenge_info.get("id")),
                             "challenge_name": chal_name,
                             "category": challenge_info.get("category"),
+                            "source": challenge_source(challenge_info),
                             "source_url": source_url,
                             "original_name": original_name,
                             "stored_name": stored_name,
@@ -1386,7 +1460,7 @@ def refresh_account_after_login(account, accounts_data, cfg, progress_id=None, f
     if previsit:
         previsit_cached_challenge_details(client, account_id=account["id"], progress_id=progress_id, username=account.get("username"))
     solves_data = load_solves()
-    set_account_solves(solves_data, account, client.list_solves())
+    set_account_solves(solves_data, account, client.list_all_solves())
     save_solves(solves_data)
     save_accounts(accounts_data)
     return client
@@ -1430,6 +1504,7 @@ def flatten_files(files_data, account_id=None, chal_id=None):
                 row.setdefault("challenge_id", int(cid) if str(cid).isdigit() else cid)
                 row.setdefault("challenge_name", challenge_display_name(chal) or item.get("challenge_name") or cid)
                 row.setdefault("category", chal.get("category") or item.get("category"))
+                row.setdefault("source", chal.get("source") or item.get("source") or CHALLENGE_SOURCE_DEFAULT)
                 rows.append(row)
     rows.sort(key=lambda item: (item.get("account_username", ""), str(item.get("challenge_id", "")), item.get("original_name", "")))
     return rows
@@ -1512,6 +1587,7 @@ def flatten_flags(flags_data, account_id=None, chal_id=None):
         row.setdefault("flag_md5", flag_md5(row.get("flag")))
         row.setdefault("challenge_name", challenge_display_name(chal) or item.get("challenge_name") or cid)
         row.setdefault("category", chal.get("category") or item.get("category"))
+        row.setdefault("source", chal.get("source") or item.get("source") or CHALLENGE_SOURCE_DEFAULT)
         if not row.get("attachment_md5"):
             row["attachment_md5"] = md5_by_key.get((row.get("account_id"), str(row.get("chal_id"))), "")
         key = row.get("dedupe_key") or flag_record_key(row.get("chal_id") or 0, row.get("flag_md5"), row.get("attachment_md5"))
@@ -1546,6 +1622,7 @@ def save_challenge_detail(chal_id, detail, fallback=None):
     merged = dict(fallback or previous)
     merged.update(detail or {})
     merged["id"] = int(chal_id) if str(chal_id).isdigit() else chal_id
+    merged["source"] = normalize_challenge_source(merged.get("source") or previous.get("source"))
     if custom_name:
         merged["custom_name"] = custom_name
         merged["name"] = custom_name
@@ -1569,8 +1646,10 @@ def cached_account_challenge_detail(account_id, client, chal_id):
     return copy.deepcopy(detail) if detail else None
 
 
-def refresh_challenge_detail_for_account(client, chal_id, fallback=None, account_id=None):
-    detail = client.get_challenge_detail(chal_id)
+def refresh_challenge_detail_for_account(client, chal_id, fallback=None, account_id=None, source=None):
+    source = normalize_challenge_source(source or cached_challenge_source(chal_id, fallback=fallback))
+    detail = client.get_challenge_detail(chal_id, source=source)
+    detail.setdefault("source", source)
     merged = save_challenge_detail(chal_id, detail, fallback=fallback)
     cache_account_challenge_detail(account_id, client, chal_id, merged)
     return merged
@@ -1597,11 +1676,11 @@ def challenge_visit_account_ids(chal_id, accounts):
     )
 
 
-def ensure_challenge_detail_before_submit(client, chal_id, account_id=None, force=False):
+def ensure_challenge_detail_before_submit(client, chal_id, account_id=None, force=False, source=None):
     visit_key = challenge_visit_key(account_id, client, chal_id)
     if not force and visit_key in CHALLENGE_DETAIL_VISITS:
         return None
-    detail = refresh_challenge_detail_for_account(client, chal_id, account_id=account_id)
+    detail = refresh_challenge_detail_for_account(client, chal_id, account_id=account_id, source=source)
     mark_challenge_detail_visited(account_id, client, chal_id)
     return detail
 
@@ -1619,7 +1698,7 @@ def previsit_cached_challenge_details(client, account_id=None, challenge_ids=Non
         if challenge_visit_key(account_id, client, chal_id) in CHALLENGE_DETAIL_VISITS:
             continue
         try:
-            refresh_challenge_detail_for_account(client, chal_id, account_id=account_id)
+            refresh_challenge_detail_for_account(client, chal_id, fallback=items.get(str(chal_id), {}), account_id=account_id)
             mark_challenge_detail_visited(account_id, client, chal_id)
         except ISCCError as exc:
             log_event("warn", "challenge_detail_previsit_failed", account_id=account_id, username=username or client.username, chal_id=chal_id, proxy=client.proxy_label, error=str(exc))
@@ -1634,13 +1713,15 @@ def flag_record_key(chal_id, flag_hash, attachment_md5=""):
 
 
 def submit_flag_for_account(account, client, chal_id, flag, flags_data, md5="", source="submit"):
-    ensure_challenge_detail_before_submit(client, int(chal_id), account_id=account.get("id"))
-    submit_result = client.submit_flag(int(chal_id), flag)
+    challenge_track = cached_challenge_source(chal_id)
+    ensure_challenge_detail_before_submit(client, int(chal_id), account_id=account.get("id"), source=challenge_track)
+    submit_result = client.submit_flag(int(chal_id), flag, source=challenge_track)
     row = {
         "account_id": account.get("id"),
         "account_username": account.get("username"),
         "proxy": client.proxy_label,
         "chal_id": int(chal_id),
+        "source": challenge_track,
     }
     row.update(submit_result)
     row["ok"] = bool(submit_result.get("ok"))
@@ -2157,7 +2238,7 @@ def api_sync_challenges():
     update_progress(progress_id, 0, 1, account.get("username"), f"正在准备同步题目：{account.get('username')}")
     try:
         client = get_ready_client(account, accounts_data, cfg)
-        listed = client.list_challenges()
+        listed = client.list_all_challenges()
         requested_ids = body.get("chal_ids") if isinstance(body.get("chal_ids"), list) and body.get("chal_ids") else None
         requested_ids = {str(item) for item in requested_ids if str(item).strip()} if requested_ids else None
         listed = [chal for chal in listed if not requested_ids or str(chal.get("id")) in requested_ids]
@@ -2174,18 +2255,21 @@ def api_sync_challenges():
             if chal_id is None:
                 continue
             seen_ids.add(str(chal_id))
+            source = challenge_source(chal)
             try:
-                detail = client.get_challenge_detail(chal_id)
+                detail = client.get_challenge_detail(chal_id, source=source)
                 mark_challenge_detail_visited(account.get("id"), client, chal_id)
                 merged = dict(chal)
                 merged.update(detail)
                 merged["id"] = int(chal_id)
+                merged["source"] = source
                 merged.setdefault("files", [])
                 items[str(chal_id)] = merged
                 save_challenges({"updated_at": utc_now(), "items": items})
             except ISCCError as exc:
                 partial = dict(items.get(str(chal_id), {}))
                 partial.update(chal)
+                partial["source"] = source
                 partial.setdefault("name", f"#{chal_id}")
                 partial.setdefault("files", [])
                 items[str(chal_id)] = partial
@@ -2230,7 +2314,7 @@ def api_sync_solves():
         update_progress(progress_id, index, total, account.get("username"), f"正在同步题解：{account.get('username')}")
         try:
             client = get_ready_client(account, accounts_data, cfg)
-            solves = client.list_solves()
+            solves = client.list_all_solves()
             set_account_solves(solves_data, account, solves)
             solves_data["updated_at"] = utc_now()
             save_solves(solves_data)
@@ -2273,7 +2357,7 @@ def sync_run_operation(progress_id, body):
     try:
         update_progress(progress_id, 0, total, first.get("username"), f"正在同步题目：{first.get('username')}")
         client = get_ready_client(first, accounts_data, cfg)
-        listed = client.list_challenges()
+        listed = client.list_all_challenges()
         listed = [chal for chal in listed if not requested_ids or str(chal.get("id")) in requested_ids]
         challenges_data = load_challenges()
         items = dict(challenges_data.get("items", {}))
@@ -2285,14 +2369,16 @@ def sync_run_operation(progress_id, body):
             name = chal.get("name") or f"#{chal_id}"
             update_progress(progress_id, 0, total, first.get("username"), f"正在同步题目详情：{detail_index}/{len(listed)} {name}")
             seen_ids.add(str(chal_id))
+            source = challenge_source(chal)
             try:
-                detail = client.get_challenge_detail(chal_id)
+                detail = client.get_challenge_detail(chal_id, source=source)
                 mark_challenge_detail_visited(first.get("id"), client, chal_id)
                 previous = items.get(str(chal_id), {})
                 custom_name = previous.get("custom_name")
                 merged = dict(chal)
                 merged.update(detail)
                 merged["id"] = int(chal_id)
+                merged["source"] = source
                 if custom_name:
                     merged["custom_name"] = custom_name
                     merged["name"] = custom_name
@@ -2301,6 +2387,7 @@ def sync_run_operation(progress_id, body):
             except ISCCError as exc:
                 partial = dict(items.get(str(chal_id), {}))
                 partial.update(chal)
+                partial["source"] = source
                 partial.setdefault("name", name)
                 partial.setdefault("files", [])
                 items[str(chal_id)] = partial
@@ -2330,7 +2417,7 @@ def sync_run_operation(progress_id, body):
             client = get_ready_client(account, accounts_data, cfg)
             if synced_challenge_ids:
                 previsit_cached_challenge_details(client, account_id=account["id"], challenge_ids=synced_challenge_ids, progress_id=progress_id, username=account.get("username"), delay_seconds=delay_seconds)
-            solves = client.list_solves()
+            solves = client.list_all_solves()
             set_account_solves(solves_data, account, solves)
             results.append({"account_id": account["id"], "account_username": account.get("username"), "ok": True, "count": len(solves)})
             add_progress_event(progress_id, account.get("username"), True, f"题解同步成功：{len(solves)} 条，已访问 {len(synced_challenge_ids)} 个题目详情")
@@ -2581,7 +2668,7 @@ def api_submit():
         if result["ok"]:
             try:
                 solves_data = load_solves()
-                set_account_solves(solves_data, account, client.list_solves())
+                set_account_solves(solves_data, account, client.list_all_solves())
                 save_solves(solves_data)
             except ISCCError as exc:
                 log_event("warn", "post_submit_solves_refresh_failed", account_id=account.get("id"), username=account.get("username"), chal_id=int(chal_id), error=str(exc))
@@ -2715,7 +2802,7 @@ def submit_batch_operation(progress_id, body):
             add_progress_event(progress_id, account.get("username"), account_ok, "提交成功" if account_ok else (account_errors[0] if account_errors else "提交失败"))
             if any_success:
                 try:
-                    solves = client.list_solves()
+                    solves = client.list_all_solves()
                     solves_data = load_solves()
                     set_account_solves(solves_data, account, solves)
                     save_solves(solves_data)
@@ -2789,7 +2876,7 @@ def files_update_operation(progress_id, body):
         try:
             client = get_ready_client(account, accounts_data, cfg)
             try:
-                solves = client.list_solves()
+                solves = client.list_all_solves()
                 set_account_solves(solves_data, account, solves)
                 solves_data["updated_at"] = utc_now()
                 save_solves(solves_data)
@@ -2798,7 +2885,7 @@ def files_update_operation(progress_id, body):
                 log_event("warn", "iscc_solves_update_failed", account_id=account.get("id"), username=account.get("username"), error=str(exc))
             account_challenges = list(selected_challenges)
             if not account_challenges:
-                listed = client.list_challenges()
+                listed = client.list_all_challenges()
                 listed_map = {str(chal.get("id")): chal for chal in listed if chal.get("id") is not None}
                 wanted_ids = chal_ids or set(listed_map.keys())
                 account_challenges = [(chal_id, listed_map.get(str(chal_id), {"id": chal_id, "name": f"#{chal_id}"})) for chal_id in wanted_ids if str(chal_id) in listed_map or chal_ids]
