@@ -32,14 +32,12 @@
 
 ![](https://cdn.nlark.com/yuque/0/2026/png/35229002/1778078849489-2bf74b76-f86e-46bb-a72b-f181bb264d99.png)
 
-![](https://cdn.nlark.com/yuque/0/2026/png/35229002/1778078875872-b0a0ed78-5a3b-4c2e-a0a7-cc2bf0e4985e.png)
 
 提交：
 
 + 支持 md5 自动匹配提交 flag，会自动匹配题目和用户
 + 支持批量题目提交
 
-![](https://cdn.nlark.com/yuque/0/2026/png/35229002/1778078984038-dc0dfdb9-d2c1-40c5-a768-83673106ad97.png)
 
 配置：
 
