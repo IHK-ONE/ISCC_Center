@@ -1248,6 +1248,8 @@ class ISCCClient:
 
     def submit_flag(self, chal_id, flag, source=CHALLENGE_SOURCE_DEFAULT):
         source = normalize_challenge_source(source)
+        log_chal_id = challenge_cache_key(source, chal_id)
+        remote_chal_id = challenge_remote_id(chal_id, source)
         with self.lock:
             last_result = None
             last_error = None
@@ -1260,7 +1262,7 @@ class ISCCClient:
                         result["attempts"] = attempt
                         return result
                     last_result = result
-                    log_event("warn", "iscc_submit_retry", username=self.username, proxy=self.proxy_label, chal_id=chal_id, attempt=attempt, reason=result.get("message"), raw=result.get("raw"))
+                    log_event("warn", "iscc_submit_retry", username=self.username, proxy=self.proxy_label, chal_id=log_chal_id, source=source, remote_chal_id=remote_chal_id, attempt=attempt, reason=result.get("message"), raw=result.get("raw"))
                 except ISCCError as exc:
                     last_error = str(exc)
                     if exc.auth_error:
@@ -1269,8 +1271,8 @@ class ISCCClient:
                         try:
                             self.get_challenge_detail_once(chal_id, source=source)
                         except ISCCError as detail_exc:
-                            log_event("warn", "submit_gateway_chal_detail_refresh_failed", username=self.username, proxy=self.proxy_label, chal_id=chal_id, error=str(detail_exc))
-                    log_event("warn" if attempt < ISCC_RETRY_ATTEMPTS else "error", "iscc_submit_retry_failed", username=self.username, proxy=self.proxy_label, chal_id=chal_id, attempt=attempt, auth_error=exc.auth_error, transient=exc.transient, error=str(exc))
+                            log_event("warn", "submit_gateway_chal_detail_refresh_failed", username=self.username, proxy=self.proxy_label, chal_id=log_chal_id, source=source, remote_chal_id=remote_chal_id, error=str(detail_exc))
+                    log_event("warn" if attempt < ISCC_RETRY_ATTEMPTS else "error", "iscc_submit_retry_failed", username=self.username, proxy=self.proxy_label, chal_id=log_chal_id, source=source, remote_chal_id=remote_chal_id, attempt=attempt, auth_error=exc.auth_error, transient=exc.transient, error=str(exc))
                     if attempt >= ISCC_RETRY_ATTEMPTS:
                         break
                 if attempt < ISCC_RETRY_ATTEMPTS:
